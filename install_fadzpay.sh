@@ -12,6 +12,8 @@ umask 077
 # - QUEUE + RETRY + BACKOFF (anti miss when internet/server down)
 # - TTL queue (drop too-old pending items)
 # - NET-CHECK (skip flush when network really down)
+# - ✅ QUEUE DEDUPE (anti duplicate queue when offline)
+# - ✅ INTERVAL_SEC supports float (e.g. 0.5)
 # =================================================
 
 RED='\033[0;31m'
@@ -141,7 +143,6 @@ ok "Prepared: $BASE_DIR"
 info "[5/8] Configuration setup..."
 echo
 
-# normalize base url (remove trailing slash)
 normalize_url() {
   local u="$1"
   while [[ "$u" == */ ]]; do u="${u%/}"; done
@@ -179,11 +180,17 @@ echo
 PIN="${PIN:-$DEFAULT_PIN}"
 ok "PIN configured"
 
-read -rp "$(echo -e ${CYAN}INTERVAL_SEC${NC}) [default: 3]: " INTERVAL_SEC
-INTERVAL_SEC="${INTERVAL_SEC:-3}"
-if ! [[ "$INTERVAL_SEC" =~ ^[0-9]+$ ]] || [ "$INTERVAL_SEC" -lt 1 ]; then
-  warn "INTERVAL_SEC invalid, set to 3"
-  INTERVAL_SEC=3
+# ✅ float interval support
+read -rp "$(echo -e ${CYAN}INTERVAL_SEC${NC}) (boleh float, contoh 0.5) [default: 0.5]: " INTERVAL_SEC
+INTERVAL_SEC="${INTERVAL_SEC:-0.5}"
+if ! [[ "$INTERVAL_SEC" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  warn "INTERVAL_SEC invalid, set to 0.5"
+  INTERVAL_SEC="0.5"
+fi
+# minimal 0.2s biar gak kebangetan
+if ! awk -v v="$INTERVAL_SEC" 'BEGIN{exit !(v>=0.2)}'; then
+  warn "INTERVAL_SEC terlalu kecil, set ke 0.5"
+  INTERVAL_SEC="0.5"
 fi
 ok "Interval: ${INTERVAL_SEC}s"
 
@@ -203,7 +210,6 @@ if ! [[ "$WATCHDOG_INTERVAL" =~ ^[0-9]+$ ]] || [ "$WATCHDOG_INTERVAL" -lt 5 ]; t
 fi
 ok "Watchdog interval: ${WATCHDOG_INTERVAL}s"
 
-# Queue tuning
 read -rp "$(echo -e ${CYAN}QUEUE_MAX_LINES${NC}) [default: 3000]: " QUEUE_MAX_LINES
 QUEUE_MAX_LINES="${QUEUE_MAX_LINES:-3000}"
 if ! [[ "$QUEUE_MAX_LINES" =~ ^[0-9]+$ ]] || [ "$QUEUE_MAX_LINES" -lt 200 ]; then
@@ -276,7 +282,7 @@ SCAN_EOF
 chmod +x "$BIN_DIR/scan_notifs.sh"
 ok "Created: scan_notifs.sh"
 
-# forwarder.sh (queue + retry + ttl + net-check)
+# forwarder.sh (queue + retry + ttl + net-check + ✅ queue dedupe)
 cat > "$BIN_DIR/forwarder.sh" <<'FORWARDER_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
@@ -321,6 +327,8 @@ WEBHOOK_URL="${API_BASE}/webhook/payment?token=${TOKEN}"
 QUEUE_MAX_LINES="${QUEUE_MAX_LINES:-3000}"
 QUEUE_TTL_HOURS="${QUEUE_TTL_HOURS:-48}"
 NETCHECK_ENABLE="${NETCHECK_ENABLE:-1}"
+INTERVAL_SEC="${INTERVAL_SEC:-0.5}"
+MIN_AMOUNT="${MIN_AMOUNT:-1}"
 
 TTL_MS=$(( QUEUE_TTL_HOURS * 60 * 60 * 1000 ))
 
@@ -387,17 +395,41 @@ net_is_up(){
   [ "$code" != "000" ]
 }
 
-# ---- In-memory seen ----
+# ---- In-memory seen (sent ok) ----
 declare -A SEEN
 while read -r fp; do
   [ -n "$fp" ] && SEEN["$fp"]=1 || true
 done < <(tail -n 8000 "$STATE_FILE" 2>/dev/null || true)
 
-# ---- Queue push ----
+# ---- Queue index (dedupe offline) ----
+declare -A QIDX
+if [ -s "$QUEUE_FILE" ]; then
+  while read -r fp; do
+    [ -n "$fp" ] && QIDX["$fp"]=1 || true
+  done < <(jq -r '.fingerprint // empty' "$QUEUE_FILE" 2>/dev/null | tail -n 12000 || true)
+fi
+
+rebuild_qidx(){
+  unset QIDX 2>/dev/null || true
+  declare -A QIDX
+  if [ -s "$QUEUE_FILE" ]; then
+    while read -r fp; do
+      [ -n "$fp" ] && QIDX["$fp"]=1 || true
+    done < <(jq -r '.fingerprint // empty' "$QUEUE_FILE" 2>/dev/null | tail -n 12000 || true)
+  fi
+}
+
+# ---- Queue push (DEDUPED) ----
 queue_push(){
   local fingerprint="$1"
   local payload="$2"
   local now
+
+  # ✅ prevent duplicates while offline
+  if [[ -n "${QIDX[$fingerprint]:-}" ]]; then
+    return 0
+  fi
+
   now="$(now_ms)"
   jq -nc \
     --arg fp "$fingerprint" \
@@ -405,6 +437,8 @@ queue_push(){
     --arg now "$now" \
     '{fingerprint:$fp, payload:$payload, next_try_ms:($now|tonumber), attempts:0, created_ms:($now|tonumber)}' \
     >> "$QUEUE_FILE"
+
+  QIDX["$fingerprint"]=1
   trim_queue
 }
 
@@ -414,7 +448,6 @@ queue_flush(){
 
   if [ "$NETCHECK_ENABLE" = "1" ]; then
     if ! net_is_up; then
-      # net down -> skip flush quietly
       return 0
     fi
   fi
@@ -433,8 +466,9 @@ queue_flush(){
     attempts="$(jq -r '.attempts // 0' <<<"$line" 2>/dev/null || echo 0)"
     created="$(jq -r '.created_ms // 0' <<<"$line" 2>/dev/null || echo 0)"
 
-    # if already seen -> drop
+    # if already sent -> drop
     if [ -n "$fp" ] && [[ -n "${SEEN[$fp]:-}" ]]; then
+      unset 'QIDX[$fp]' 2>/dev/null || true
       continue
     fi
 
@@ -443,6 +477,7 @@ queue_flush(){
       age=$(( now - created ))
       if [ "$age" -gt "$TTL_MS" ]; then
         log "⚠ [QUEUE] drop TTL | fp=${fp:0:10} | age_ms=$age"
+        unset 'QIDX[$fp]' 2>/dev/null || true
         continue
       fi
     fi
@@ -454,7 +489,7 @@ queue_flush(){
     fi
 
     # broken item -> drop
-    [ -n "$payload" ] || continue
+    [ -n "$payload" ] || { unset 'QIDX[$fp]' 2>/dev/null || true; continue; }
 
     resp="$(post_json "$payload" || true)"
 
@@ -463,6 +498,7 @@ queue_flush(){
         SEEN["$fp"]=1
         echo "$fp" >> "$STATE_FILE"
         trim_state
+        unset 'QIDX[$fp]' 2>/dev/null || true
       fi
       log "✓ [QUEUE] sent | fp=${fp:0:10} | ${resp}"
       continue
@@ -487,6 +523,7 @@ queue_flush(){
 
   mv "$QUEUE_TMP" "$QUEUE_FILE"
   trim_queue
+  rebuild_qidx
 }
 
 termux-wake-lock 2>/dev/null || true
@@ -511,6 +548,7 @@ log "🎯 Target : $WEBHOOK_URL"
 log "⏱️  Interval: ${INTERVAL_SEC}s"
 log "💰 Min Amount: Rp ${MIN_AMOUNT}"
 log "📦 Queue file: $QUEUE_FILE (max_lines=$QUEUE_MAX_LINES, ttl_h=$QUEUE_TTL_HOURS)"
+log "🧠 Queue dedupe: enabled"
 log "🌐 Net-check: $([ "$NETCHECK_ENABLE" = "1" ] && echo enabled || echo disabled)"
 log "════════════════════════════════════════════════════════════"
 
@@ -549,7 +587,14 @@ while :; do
     fi
 
     fingerprint="$(printf '%s' "$pkg|$title|$content|$when|$key" | sha256sum | awk '{print $1}')"
+
+    # already sent
     if [[ -n "${SEEN[$fingerprint]:-}" ]]; then
+      continue
+    fi
+
+    # ✅ already queued (offline) -> don't queue again
+    if [[ -n "${QIDX[$fingerprint]:-}" ]]; then
       continue
     fi
 
@@ -609,7 +654,7 @@ FORWARDER_EOF
 
 sed -i "s|__BASE_DIR__|$BASE_DIR|g" "$BIN_DIR/forwarder.sh"
 chmod +x "$BIN_DIR/forwarder.sh"
-ok "Created: forwarder.sh (Queue+TTL+NetCheck)"
+ok "Created: forwarder.sh (Queue+TTL+NetCheck+QueueDedupe)"
 
 # forwarderctl.sh (tmux)
 cat > "$BIN_DIR/forwarderctl.sh" <<'CTL_EOF'
