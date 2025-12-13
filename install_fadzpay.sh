@@ -12,8 +12,9 @@ umask 077
 # - QUEUE + RETRY + BACKOFF (anti miss when internet/server down)
 # - TTL queue (drop too-old pending items)
 # - NET-CHECK (skip flush when network really down)
-# - ✅ QUEUE DEDUPE (anti duplicate queue when offline)
-# - ✅ INTERVAL_SEC supports float (e.g. 0.5)
+# - QUEUE DEDUPE (anti duplicate queue when offline)
+# - INTERVAL_SEC supports float (e.g. 0.5)
+# - DEVICE_ID (manual or auto UUID) -> sent to worker
 # =================================================
 
 RED='\033[0;31m'
@@ -95,6 +96,17 @@ backup_or_remove_old_install() {
     mv "$BASE_DIR" "$backup"
     ok "Backup created"
   fi
+}
+
+# Generate device id (UUID)
+gen_device_id() {
+  if [ -r /proc/sys/kernel/random/uuid ]; then
+    cat /proc/sys/kernel/random/uuid | tr -d '\n'
+    return 0
+  fi
+  local a
+  a="$(openssl rand -hex 16 2>/dev/null || date +%s%N)"
+  echo "${a:0:8}-${a:8:4}-${a:12:4}-${a:16:4}-${a:20:12}"
 }
 
 # ============================================================================
@@ -180,6 +192,12 @@ echo
 PIN="${PIN:-$DEFAULT_PIN}"
 ok "PIN configured"
 
+# ✅ DEVICE_ID prompt (enter = auto UUID)
+DEFAULT_DEVICE_ID="$(gen_device_id)"
+read -rp "$(echo -e ${CYAN}DEVICE_ID${NC}) (opsional, contoh: S8-WIFI / S8-PLUS-DATA) [enter=auto]: " DEVICE_ID
+DEVICE_ID="${DEVICE_ID:-$DEFAULT_DEVICE_ID}"
+ok "Device ID: ${DEVICE_ID}"
+
 # ✅ float interval support
 read -rp "$(echo -e ${CYAN}INTERVAL_SEC${NC}) (boleh float, contoh 0.5) [default: 0.5]: " INTERVAL_SEC
 INTERVAL_SEC="${INTERVAL_SEC:-0.5}"
@@ -187,7 +205,6 @@ if ! [[ "$INTERVAL_SEC" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   warn "INTERVAL_SEC invalid, set to 0.5"
   INTERVAL_SEC="0.5"
 fi
-# minimal 0.2s biar gak kebangetan
 if ! awk -v v="$INTERVAL_SEC" 'BEGIN{exit !(v>=0.2)}'; then
   warn "INTERVAL_SEC terlalu kecil, set ke 0.5"
   INTERVAL_SEC="0.5"
@@ -238,6 +255,7 @@ API_BASE='${API_BASE}'
 TOKEN='${TOKEN}'
 SECRET='${SECRET}'
 PIN='${PIN}'
+DEVICE_ID='${DEVICE_ID}'
 INTERVAL_SEC='${INTERVAL_SEC}'
 MIN_AMOUNT='${MIN_AMOUNT}'
 WATCHDOG_INTERVAL='${WATCHDOG_INTERVAL}'
@@ -282,7 +300,7 @@ SCAN_EOF
 chmod +x "$BIN_DIR/scan_notifs.sh"
 ok "Created: scan_notifs.sh"
 
-# forwarder.sh (queue + retry + ttl + net-check + ✅ queue dedupe)
+# forwarder.sh (queue + retry + ttl + net-check + queue dedupe + device_id)
 cat > "$BIN_DIR/forwarder.sh" <<'FORWARDER_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
@@ -309,7 +327,7 @@ need(){ command -v "$1" >/dev/null 2>&1 || { echo "❌ Missing: $1"; exit 1; }; 
 need jq; need curl; need openssl; need awk; need grep; need sed; need sha256sum; need wc; need tail; need mv; need mkdir
 need termux-notification-list; need termux-notification
 
-mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")" "$QUEUE_DIR"
+mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")" "$QUEUE_DIR" "$BASE_DIR/state"
 touch "$LOG_FILE" "$STATE_FILE" "$QUEUE_FILE"
 chmod 600 "$STATE_FILE" "$QUEUE_FILE" 2>/dev/null || true
 
@@ -322,7 +340,7 @@ fi
 source "$CONFIG_FILE"
 
 API_BASE="${API_BASE%/}"
-WEBHOOK_URL="${API_BASE}/webhook/payment?token=${TOKEN}"
+WEBHOOK_URL="${API_BASE}/webhook/payment"
 
 QUEUE_MAX_LINES="${QUEUE_MAX_LINES:-3000}"
 QUEUE_TTL_HOURS="${QUEUE_TTL_HOURS:-48}"
@@ -331,6 +349,8 @@ INTERVAL_SEC="${INTERVAL_SEC:-0.5}"
 MIN_AMOUNT="${MIN_AMOUNT:-1}"
 
 TTL_MS=$(( QUEUE_TTL_HOURS * 60 * 60 * 1000 ))
+
+DEVICE_ID_STATE="$BASE_DIR/state/device_id.txt"
 
 log(){ echo "$*" | tee -a "$LOG_FILE"; }
 
@@ -360,6 +380,26 @@ now_ms(){
   if [ -n "$t" ] && [[ "$t" =~ ^[0-9]+$ ]]; then echo "$t"; else echo $(( $(date +%s) * 1000 )); fi
 }
 
+gen_device_id(){
+  if [ -r /proc/sys/kernel/random/uuid ]; then
+    cat /proc/sys/kernel/random/uuid | tr -d '\n'
+    return 0
+  fi
+  local a
+  a="$(openssl rand -hex 16 2>/dev/null || date +%s%N)"
+  echo "${a:0:8}-${a:8:4}-${a:12:4}-${a:16:4}-${a:20:12}"
+}
+
+DEVICE_ID="${DEVICE_ID:-}"
+if [ -z "${DEVICE_ID}" ] && [ -s "$DEVICE_ID_STATE" ]; then
+  DEVICE_ID="$(cat "$DEVICE_ID_STATE" 2>/dev/null | head -n1 | tr -d '\r\n' || true)"
+fi
+if [ -z "${DEVICE_ID}" ]; then
+  DEVICE_ID="$(gen_device_id)"
+  echo "$DEVICE_ID" > "$DEVICE_ID_STATE"
+  chmod 600 "$DEVICE_ID_STATE" 2>/dev/null || true
+fi
+
 hmac_sig_hex(){
   local msg="$1"
   printf '%s' "$msg" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}'
@@ -375,8 +415,9 @@ post_json(){
   out="$(curl -sS --max-time 12 --connect-timeout 6 \
     --retry 1 --retry-delay 1 --retry-connrefused \
     -H "Content-Type: application/json" \
-    -H "X-Forwarder-Secret: ${SECRET}" \
+    -H "X-Forwarder-Token: ${TOKEN}" \
     -H "X-Forwarder-Pin: ${PIN}" \
+    -H "X-Device-Id: ${DEVICE_ID}" \
     -H "X-TS: ${ts}" \
     -H "X-Signature: ${sig}" \
     -X POST "$WEBHOOK_URL" \
@@ -389,19 +430,16 @@ post_json(){
 is_http_2xx(){ [[ "$1" =~ HTTP=2[0-9][0-9]$ ]]; }
 
 net_is_up(){
-  # Return 0 if we can reach API_BASE (any http code except 000), else 1
   local code
   code="$(curl -sS -I --max-time 5 --connect-timeout 4 "$API_BASE" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")"
   [ "$code" != "000" ]
 }
 
-# ---- In-memory seen (sent ok) ----
 declare -A SEEN
 while read -r fp; do
   [ -n "$fp" ] && SEEN["$fp"]=1 || true
 done < <(tail -n 8000 "$STATE_FILE" 2>/dev/null || true)
 
-# ---- Queue index (dedupe offline) ----
 declare -A QIDX
 if [ -s "$QUEUE_FILE" ]; then
   while read -r fp; do
@@ -419,13 +457,11 @@ rebuild_qidx(){
   fi
 }
 
-# ---- Queue push (DEDUPED) ----
 queue_push(){
   local fingerprint="$1"
   local payload="$2"
   local now
 
-  # ✅ prevent duplicates while offline
   if [[ -n "${QIDX[$fingerprint]:-}" ]]; then
     return 0
   fi
@@ -442,7 +478,6 @@ queue_push(){
   trim_queue
 }
 
-# ---- Queue flush (retry pending) ----
 queue_flush(){
   [ -s "$QUEUE_FILE" ] || return 0
 
@@ -466,13 +501,11 @@ queue_flush(){
     attempts="$(jq -r '.attempts // 0' <<<"$line" 2>/dev/null || echo 0)"
     created="$(jq -r '.created_ms // 0' <<<"$line" 2>/dev/null || echo 0)"
 
-    # if already sent -> drop
     if [ -n "$fp" ] && [[ -n "${SEEN[$fp]:-}" ]]; then
       unset 'QIDX[$fp]' 2>/dev/null || true
       continue
     fi
 
-    # TTL drop
     if [ "${created:-0}" -gt 0 ]; then
       age=$(( now - created ))
       if [ "$age" -gt "$TTL_MS" ]; then
@@ -482,13 +515,11 @@ queue_flush(){
       fi
     fi
 
-    # not time yet -> keep
     if [ "${next_try:-0}" -gt "$now" ]; then
       echo "$line" >> "$QUEUE_TMP"
       continue
     fi
 
-    # broken item -> drop
     [ -n "$payload" ] || { unset 'QIDX[$fp]' 2>/dev/null || true; continue; }
 
     resp="$(post_json "$payload" || true)"
@@ -545,6 +576,7 @@ log "  fadzPay Forwarder (GoPay Merchant) + Queue/TTL/NetCheck"
 log "════════════════════════════════════════════════════════════"
 log "▶️  Started: $(date '+%Y-%m-%d %H:%M:%S')"
 log "🎯 Target : $WEBHOOK_URL"
+log "📱 Device : $DEVICE_ID"
 log "⏱️  Interval: ${INTERVAL_SEC}s"
 log "💰 Min Amount: Rp ${MIN_AMOUNT}"
 log "📦 Queue file: $QUEUE_FILE (max_lines=$QUEUE_MAX_LINES, ttl_h=$QUEUE_TTL_HOURS)"
@@ -588,12 +620,10 @@ while :; do
 
     fingerprint="$(printf '%s' "$pkg|$title|$content|$when|$key" | sha256sum | awk '{print $1}')"
 
-    # already sent
     if [[ -n "${SEEN[$fingerprint]:-}" ]]; then
       continue
     fi
 
-    # ✅ already queued (offline) -> don't queue again
     if [[ -n "${QIDX[$fingerprint]:-}" ]]; then
       continue
     fi
@@ -607,6 +637,7 @@ while :; do
       --arg key "$key" \
       --arg fingerprint "$fingerprint" \
       --arg amount "$amt" \
+      --arg device_id "$DEVICE_ID" \
       '{
         source: $source,
         package: $package,
@@ -615,14 +646,15 @@ while :; do
         when: $when,
         key: $key,
         fingerprint: $fingerprint,
-        amount: ($amount|tonumber)
+        amount: ($amount|tonumber),
+        device_id: $device_id
       }'
     )"
 
     tslog="$(date '+%Y-%m-%d %H:%M:%S')"
     resp="$(post_json "$payload" || true)"
 
-    if is_http_2xx "$resp"; then
+    if [[ "$resp" =~ HTTP=2[0-9][0-9]$ ]]; then
       SEEN["$fingerprint"]=1
       echo "$fingerprint" >> "$STATE_FILE"
       trim_state
@@ -654,7 +686,7 @@ FORWARDER_EOF
 
 sed -i "s|__BASE_DIR__|$BASE_DIR|g" "$BIN_DIR/forwarder.sh"
 chmod +x "$BIN_DIR/forwarder.sh"
-ok "Created: forwarder.sh (Queue+TTL+NetCheck+QueueDedupe)"
+ok "Created: forwarder.sh"
 
 # forwarderctl.sh (tmux)
 cat > "$BIN_DIR/forwarderctl.sh" <<'CTL_EOF'
