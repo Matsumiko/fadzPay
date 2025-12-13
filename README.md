@@ -4,37 +4,37 @@
 
 # 💳 fadzPay
 
-### *Automated GoPay Merchant Payment Forwarder*
+### *Forwarder Otomatis Notifikasi Pembayaran GoPay Merchant*
 
 **fadzPay** adalah forwarder notifikasi pembayaran GoPay Merchant yang berjalan di Android (Termux). Sistem ini membaca notification log melalui Termux:API dan secara otomatis mengirim event pembayaran ke endpoint server kamu sebagai webhook.
 
 *Ideal untuk HP dedicated (always-on) agar status pembayaran bisa diproses otomatis tanpa campur tangan manual.*
 
-[![Made with Love](https://img.shields.io/badge/Made%20with-❤️-red.svg)](https://github.com/yourusername/fadzpay)
+[![Dibuat dengan Ai](https://img.shields.io/badge/Dibuat%20dengan-🤖-red.svg)](https://github.com/yourusername/fadzpay)
 [![Android](https://img.shields.io/badge/Platform-Android-green.svg)](https://www.android.com/)
-[![Termux](https://img.shields.io/badge/Powered%20by-Termux-blue.svg)](https://termux.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Termux](https://img.shields.io/badge/Didukung%20oleh-Termux-blue.svg)](https://termux.com/)
+[![Lisensi: MIT](https://img.shields.io/badge/Lisensi-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 </div>
 
 ---
 
-## 🏗️ Architecture
+## 🏗️ Arsitektur
 
-### System Flow Diagram
+### Diagram Alur Sistem
 
 ```mermaid
 graph TD
-    A[📱 GoPay Merchant App] -->|Payment Notification| B[Android Notification System]
-    B -->|Read Logs| C[🤖 Termux:API]
-    C -->|Parse & Extract| D[fadzPay Forwarder]
-    D -->|Dedup Check| E{Already Sent?}
-    E -->|No| F[Sign Request HMAC]
-    E -->|Yes| G[Skip]
-    F -->|POST with Headers| H[🌐 Your Webhook Server]
-    H -->|Validate Signature| I{Valid?}
-    I -->|Yes| J[✅ Process Payment]
-    I -->|No| K[❌ Reject]
+    A[📱 Aplikasi GoPay Merchant] -->|Notifikasi Pembayaran| B[Sistem Notifikasi Android]
+    B -->|Baca Log| C[🤖 Termux:API]
+    C -->|Parse & Ekstrak| D[fadzPay Forwarder]
+    D -->|Cek Duplikasi| E{Sudah Dikirim?}
+    E -->|Belum| F[Tanda Tangan Request HMAC]
+    E -->|Sudah| G[Lewati]
+    F -->|POST dengan Header| H[🌐 Server Webhook Kamu]
+    H -->|Validasi Signature| I{Valid?}
+    I -->|Ya| J[✅ Proses Pembayaran]
+    I -->|Tidak| K[❌ Tolak]
     
     style A fill:#00AA13
     style D fill:#4A90E2
@@ -43,33 +43,41 @@ graph TD
     style K fill:#FF6B6B
 ```
 
-### How It Works
+### Cara Kerjanya
 
-Think of fadzPay like a **smart mailman** 📬 for your payment notifications:
+Bayangkan fadzPay seperti **tukang pos pintar** 📬 untuk notifikasi pembayaran kamu:
 
-1. **👀 The Watcher** — fadzPay constantly monitors your GoPay Merchant notifications, like a security guard checking CCTV
-2. **🧠 The Brain** — When a payment comes in, it reads the notification and extracts important info (amount, order ID, timestamp)
-3. **🔐 The Vault** — Before sending, it signs the data with HMAC (like putting a tamper-proof seal on an envelope)
-4. **📮 The Delivery** — Sends the signed payment data to your server via webhook
-5. **🛡️ The Guardian** — Your server checks the seal (HMAC signature) to make sure it's legit
-6. **🎯 The Action** — If everything checks out, your server processes the payment automatically!
+1. **👀 Pengamat** — fadzPay terus memantau notifikasi GoPay Merchant kamu, seperti satpam yang cek CCTV
+2. **🧠 Otak** — Ketika ada pembayaran masuk, dia baca notifikasi dan ekstrak info penting (jumlah, order ID, timestamp)
+3. **🔐 Brankas** — Sebelum kirim, data ditandatangani dengan HMAC (kayak kasih segel anti-rusak di amplop)
+4. **📮 Pengiriman** — Kirim data pembayaran yang sudah ditandatangani ke server kamu via webhook
+5. **🛡️ Penjaga** — Server kamu cek segel (HMAC signature) buat mastiin asli
+6. **🎯 Aksi** — Kalau semua oke, server kamu otomatis proses pembayarannya!
 
-**Real-World Analogy:**
-> Imagine you run an online store. Instead of manually checking your phone every time a customer pays via GoPay, fadzPay acts as your **virtual assistant** that instantly notifies your store system: *"Hey boss, someone just paid Rp 50,000 for Order #12345!"* — and your system automatically marks the order as paid. 🎉
-
----
-
-- **📱 Notification Monitoring** — Scan notifikasi dari GoPay Merchant (`com.gojek.gopaymerchant`)
-- **🔒 Security-First** — Request signing dengan HMAC + PIN header untuk keamanan tambahan
-- **🚫 Deduplication** — Hindari pengiriman event duplikat
-- **💪 Resilient** — Berjalan dalam tmux session untuk stabilitas maksimal
-- **🔄 Auto-Recovery** — Watchdog service otomatis restart jika forwarder mati
-- **🚀 Auto-Start** — Jalan otomatis saat reboot menggunakan Termux:Boot
-- **🧹 Smart Install** — Deteksi instalasi lama dan bersihkan sebelum install ulang
+**Analogi Kehidupan Nyata:**
+> Bayangin kamu punya toko online. Daripada manual cek HP tiap ada customer bayar via GoPay, fadzPay bertindak sebagai **asisten virtual** yang langsung kasih tau sistem toko kamu: *"Bos, ada yang baru bayar Rp 50.000 untuk Order #12345!"* — dan sistem kamu otomatis tandain ordernya sebagai lunas. 🎉
 
 ---
 
-## 📋 Requirements
+## ✨ Fitur Utama
+
+<div align="center">
+
+| Fitur | Deskripsi | Manfaat |
+|-------|-----------|---------|
+| 📱 **Monitoring Notifikasi** | Scan notifikasi GoPay Merchant | Deteksi pembayaran real-time |
+| 🔒 **Keamanan Utama** | HMAC signing + PIN header | Cegah manipulasi & akses tidak sah |
+| 🚫 **Anti Duplikasi** | Filter event pintar | Gak ada webhook dobel |
+| 💪 **Tangguh** | Jalan di sesi tmux | Tahan putus koneksi |
+| 🔄 **Auto-Recovery** | Watchdog restart otomatis | Uptime 99.9% |
+| 🚀 **Auto-Start** | Boot bareng Termux:Boot | Nol intervensi manual |
+| 🧹 **Install Pintar** | Deteksi & bersihin install lama | Fresh start setiap kali |
+
+</div>
+
+---
+
+## 📋 Kebutuhan
 
 ### Aplikasi (Install via F-Droid)
 
@@ -77,16 +85,16 @@ Think of fadzPay like a **smart mailman** 📬 for your payment notifications:
 - [Termux:API](https://f-droid.org/packages/com.termux.api/)
 - [Termux:Boot](https://f-droid.org/packages/com.termux.boot/) — untuk auto-start
 
-### Permissions
+### Izin yang Diperlukan
 
 Aktifkan izin berikut di Android:
 
-1. **Notification Access untuk Termux:API**
+1. **Akses Notifikasi untuk Termux:API**
    ```
-   Settings → Apps → Special access → Notification access → Enable Termux:API
+   Settings → Apps → Special access → Notification access → Aktifkan Termux:API
    ```
 
-2. **Battery Optimization (Recommended)**
+2. **Optimasi Baterai (Disarankan)**
    
    Set ke "Unrestricted" untuk aplikasi berikut:
    - Termux
@@ -99,25 +107,25 @@ Aktifkan izin berikut di Android:
 
 ## 🚀 Instalasi
 
-### Quick Start
+### Mulai Cepat
 
 <div align="center">
 
 ```bash
-# 1️⃣ Download & make executable
+# 1️⃣ Download & jadikan executable
 chmod +x install_fadzpay.sh
 
-# 2️⃣ Run installer
+# 2️⃣ Jalankan installer
 ./install_fadzpay.sh
 
-# 3️⃣ Follow the prompts and you're done! 🎉
+# 3️⃣ Ikuti prompt dan selesai! 🎉
 ```
 
 </div>
 
 ---
 
-### Interactive Mode (Recommended)
+### Mode Interaktif (Disarankan)
 
 ```bash
 chmod +x install_fadzpay.sh
@@ -128,19 +136,19 @@ Ikuti prompt untuk mengisi konfigurasi:
 
 <div align="center">
 
-| Variable | Deskripsi | Contoh |
+| Variabel | Deskripsi | Contoh |
 |----------|-----------|--------|
 | `API_BASE_URL` | Endpoint webhook server kamu | `https://wb.domainkamu.id` |
 | `TOKEN` | Token autentikasi | `your-secret-token-here` |
 | `SECRET` | Secret key untuk HMAC signing | `your-hmac-secret-key` |
 | `PIN` | PIN tambahan untuk header request | `1234` |
 | `INTERVAL_SEC` | Interval polling notifikasi (detik) | `5` |
-| `MIN_AMOUNT` | Minimum amount untuk diforward | `1000` |
-| `WATCHDOG_INTERVAL` | Interval check watchdog (detik) | `30` |
+| `MIN_AMOUNT` | Jumlah minimum untuk diforward | `1000` |
+| `WATCHDOG_INTERVAL` | Interval cek watchdog (detik) | `30` |
 
 </div>
 
-### Non-Interactive Mode
+### Mode Non-Interaktif
 
 Untuk automation atau instalasi tanpa interaksi:
 
@@ -148,45 +156,45 @@ Untuk automation atau instalasi tanpa interaksi:
 AUTO_YES=1 ./install_fadzpay.sh
 ```
 
-> **💡 Pro Tip**: Mode ini akan menggunakan nilai default untuk semua konfigurasi.
+> **💡 Tips Pro**: Mode ini akan pakai nilai default untuk semua konfigurasi.
 
 ---
 
-## 🎮 Commands
+## 🎮 Perintah
 
 <div align="center">
 
-### Control Your fadzPay Instance
+### Kontrol Instance fadzPay Kamu
 
 </div>
 
-Semua command dijalankan melalui control script di `~/fadzpay/bin/forwarderctl.sh`:
+Semua perintah dijalankan melalui control script di `~/fadzpay/bin/forwarderctl.sh`:
 
 ---
 
-### 📊 Status Check
+### 📊 Cek Status
 
 ```bash
 ~/fadzpay/bin/forwarderctl.sh status
 ```
 
-**What it does:** Menampilkan status forwarder dan watchdog service
+**Fungsinya:** Menampilkan status forwarder dan watchdog service
 ```
-✅ fadzpay-forwarder is running (PID: 12345)
-✅ fadzpay-watchdog is running (PID: 12346)
+✅ fadzpay-forwarder sedang berjalan (PID: 12345)
+✅ fadzpay-watchdog sedang berjalan (PID: 12346)
 ```
 
 ---
 
-### 👀 Attach ke Session
+### 👀 Masuk ke Sesi
 
 ```bash
 ~/fadzpay/bin/forwarderctl.sh attach
 ```
 
-**What it does:** Lihat output real-time dari forwarder
+**Fungsinya:** Lihat output real-time dari forwarder
 
-> **💡 Tip:** Tekan `Ctrl+B` lalu `D` untuk detach tanpa stop service
+> **💡 Tips:** Tekan `Ctrl+B` lalu `D` untuk keluar tanpa stop service
 
 ---
 
@@ -196,9 +204,9 @@ Semua command dijalankan melalui control script di `~/fadzpay/bin/forwarderctl.s
 ~/fadzpay/bin/forwarderctl.sh restart
 ```
 
-**What it does:** Stop dan start ulang forwarder beserta watchdog
+**Fungsinya:** Stop dan start ulang forwarder beserta watchdog
 
-**When to use:** Setelah update config atau troubleshooting
+**Kapan dipakai:** Setelah update config atau troubleshooting
 
 ---
 
@@ -208,9 +216,9 @@ Semua command dijalankan melalui control script di `~/fadzpay/bin/forwarderctl.s
 ~/fadzpay/bin/forwarderctl.sh stop
 ```
 
-**What it does:** Hentikan forwarder dan watchdog
+**Fungsinya:** Hentikan forwarder dan watchdog
 
-**Warning:** Service tidak akan auto-restart sampai kamu start lagi!
+**Peringatan:** Service gak akan auto-restart sampai kamu start lagi!
 
 ---
 
@@ -220,27 +228,27 @@ Semua command dijalankan melalui control script di `~/fadzpay/bin/forwarderctl.s
 ~/fadzpay/bin/forwarderctl.sh start
 ```
 
-**What it does:** Jalankan forwarder dan watchdog
+**Fungsinya:** Jalankan forwarder dan watchdog
 
-**Note:** Otomatis dipanggil saat install
+**Catatan:** Otomatis dipanggil saat install
 
 ---
 
-## 📊 Logs
+## 📊 Log
 
-Monitor aktivitas fadzPay melalui log files:
+Monitor aktivitas fadzPay melalui file log:
 
-### Forwarder Logs
+### Log Forwarder
 ```bash
 tail -f ~/fadzpay/logs/fadzpay-forwarder.log
 ```
 
-### Watchdog Logs
+### Log Watchdog
 ```bash
 tail -f ~/fadzpay/logs/fadzpay-watchdog.log
 ```
 
-### View All Logs
+### Lihat Semua Log
 ```bash
 ls -lh ~/fadzpay/logs/
 ```
@@ -260,29 +268,29 @@ Script ini akan:
 - Stop semua service yang berjalan
 - Hapus tmux sessions
 - Bersihkan crontab entries
-- Remove direktori instalasi
+- Hapus direktori instalasi
 
 ---
 
-## 🔐 Security Notes
+## 🔐 Catatan Keamanan
 
-### Best Practices
+### Best Practice
 
 - ⚠️ **Jangan pernah share** kredensial `TOKEN`, `SECRET`, dan `PIN` ke siapapun
 - 🔒 **Gunakan HTTPS** untuk endpoint server kamu
-- 🛡️ **Validasi signature** di server side untuk memverifikasi authenticity request
-- ⏱️ **Implementasi timestamp check** di server untuk mencegah replay attack
+- 🛡️ **Validasi signature** di sisi server untuk verifikasi keaslian request
+- ⏱️ **Implementasi cek timestamp** di server untuk cegah replay attack
 - 🔑 **Rotate credentials** secara berkala untuk keamanan maksimal
 - 📱 **Isolasi device** — gunakan HP khusus yang tidak dipakai untuk aktivitas pribadi
 
-### Server-Side Verification
+### Verifikasi di Sisi Server
 
 Pastikan endpoint server kamu melakukan:
 
 1. Verifikasi HMAC signature di header request
-2. Check timestamp untuk mencegah replay attack (max 5 menit)
+2. Cek timestamp untuk cegah replay attack (max 5 menit)
 3. Validasi PIN header
-4. Rate limiting untuk mencegah abuse
+4. Rate limiting untuk cegah penyalahgunaan
 
 ---
 
@@ -294,9 +302,9 @@ Pastikan Termux:Boot sudah diinstall dan dibuka minimal 1x setelah instalasi.
 
 ### Notifikasi tidak terdeteksi
 
-1. Cek permission Notification Access untuk Termux:API
+1. Cek izin Akses Notifikasi untuk Termux:API
 2. Pastikan GoPay Merchant terinstall dan aktif
-3. Cek logs untuk error messages
+3. Cek log untuk pesan error
 
 ### Watchdog tidak auto-restart
 
@@ -307,8 +315,8 @@ crontab -l | grep watchdog
 
 ### Request tidak sampai ke server
 
-1. Test koneksi: `curl -I https://your-endpoint.com`
-2. Cek logs untuk HTTP error codes
+1. Test koneksi: `curl -I https://endpoint-kamu.com`
+2. Cek log untuk HTTP error codes
 3. Verifikasi `API_BASE_URL` di config
 
 ---
@@ -319,18 +327,18 @@ Lihat file `CHANGELOG.md` untuk riwayat perubahan versi.
 
 ---
 
-## 🤝 Contributing
+## 🤝 Kontribusi
 
-Contributions are welcome! Silakan buat issue atau pull request untuk:
+Kontribusi sangat diterima! Silakan buat issue atau pull request untuk:
 
-- Bug fixes
-- Feature requests
-- Documentation improvements
-- Performance optimizations
+- Perbaikan bug
+- Request fitur baru
+- Peningkatan dokumentasi
+- Optimasi performa
 
 ---
 
-## 📄 License
+## 📄 Lisensi
 
 Project ini menggunakan lisensi MIT. Lihat file `LICENSE` untuk detail lengkap.
 
@@ -351,14 +359,20 @@ Project ini menggunakan lisensi MIT. Lihat file `LICENSE` untuk detail lengkap.
 
 Jika menemukan masalah atau punya pertanyaan:
 
-1. Cek section Troubleshooting terlebih dahulu
-2. Baca logs untuk error messages
+1. Cek bagian Troubleshooting terlebih dahulu
+2. Baca log untuk pesan error
 3. Buat issue di repository dengan detail lengkap:
    - Versi Android
    - Versi Termux
-   - Error messages dari logs
-   - Steps to reproduce
+   - Pesan error dari log
+   - Langkah untuk reproduce masalah
 
 ---
 
-**Made with ❤️ for seamless payment processing**
+<div align="center">
+
+**Dibuat dengan ❤️ untuk proses pembayaran yang seamless**
+
+*Happy coding! 🚀*
+
+</div>
