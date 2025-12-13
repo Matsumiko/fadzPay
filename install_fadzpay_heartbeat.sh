@@ -77,11 +77,13 @@ source "$CONF"
 
 API_BASE="${API_BASE%/}"
 
-# endpoint heartbeat di server publik
-STATUS_URL="${API_BASE}/status/heartbeat?token=${TOKEN}"
-STATUS_VIEW="${API_BASE}/status?token=${TOKEN}"
+# ✅ Worker terbaru: PUBLIC status tanpa token, POST heartbeat tanpa token (auth via headers)
+STATUS_URL="${API_BASE}/status/heartbeat"
+STATUS_VIEW="${API_BASE}/"            # halaman status publik
+PROBE_URL="${API_BASE}/health"        # probe yang stabil
 
 DEVICE_NAME="$(getprop ro.product.model 2>/dev/null || echo "android")"
+ANDROID_VER="$(getprop ro.build.version.release 2>/dev/null || echo "-")"
 DEVICE_ID="$(getprop ro.serialno 2>/dev/null || echo "unknown")"
 
 now_ms(){
@@ -92,6 +94,7 @@ now_ms(){
 
 hmac_sig_hex(){
   local msg="$1"
+  # openssl-tool provides openssl binary
   printf '%s' "$msg" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}'
 }
 
@@ -137,35 +140,50 @@ tmux_running(){
   fi
 }
 
+forwarder_running(){
+  # best effort: check forwarderctl status or process
+  if [ -x "$BASE_DIR/bin/forwarderctl.sh" ]; then
+    "$BASE_DIR/bin/forwarderctl.sh" status >/dev/null 2>&1 && echo "1" || echo "0"
+  else
+    pgrep -f "$BASE_DIR/bin/forwarder.sh" >/dev/null 2>&1 && echo "1" || echo "0"
+  fi
+}
+
 send_once(){
-  local ts code lat qlines tmux_ok wifi tel payload sig input resp
+  local ts code lat qlines tmux_ok fw_ok wifi tel payload sig input resp
   ts="$(now_ms)"
-  read -r code lat < <(http_probe "$API_BASE")
+
+  # probe to /health (lebih stabil)
+  read -r code lat < <(http_probe "$PROBE_URL")
 
   qlines="$(queue_lines)"
   tmux_ok="$(tmux_running)"
+  fw_ok="$(forwarder_running)"
   wifi="$(wifi_info_json)"
   tel="$(telephony_info_json)"
 
   payload="$(jq -nc \
     --arg app "fadzPay" \
     --arg device_name "$DEVICE_NAME" \
+    --arg android "$ANDROID_VER" \
     --arg device_id "$DEVICE_ID" \
     --arg api_base "$API_BASE" \
     --arg http_code "$code" \
     --arg latency_ms "$lat" \
     --arg queue_lines "$qlines" \
     --arg tmux_ok "$tmux_ok" \
+    --arg fw_ok "$fw_ok" \
     --argjson wifi "$wifi" \
     --argjson telephony "$tel" \
     --arg ts "$ts" \
     '{
       app:$app,
-      device:{name:$device_name,id:$device_id},
+      device:{model:$device_name, android:$android, id:$device_id},
       api_base:$api_base,
+      net:{ok:(($http_code|tonumber) >= 200 and ($http_code|tonumber) < 500)},
       probe:{http_code:($http_code|tonumber), latency_ms:($latency_ms|tonumber)},
       queue:{lines:($queue_lines|tonumber)},
-      forwarder:{tmux_running:($tmux_ok|tonumber)},
+      forwarder:{tmux_running:($tmux_ok|tonumber), running:($fw_ok|tonumber)},
       wifi:$wifi,
       telephony:$telephony,
       ts_ms:($ts|tonumber)
@@ -185,9 +203,9 @@ send_once(){
     -w " HTTP=%{http_code}" 2>&1 || true)"
 
   if [[ "$resp" =~ HTTP=2[0-9][0-9]$ ]]; then
-    log "HB OK | code=$code lat=${lat}ms q=$qlines tmux=$tmux_ok | $resp"
+    log "HB OK | probe=$code lat=${lat}ms q=$qlines tmux=$tmux_ok fw=$fw_ok | $resp"
   else
-    log "HB FAIL | code=$code lat=${lat}ms q=$qlines tmux=$tmux_ok | $resp"
+    log "HB FAIL | probe=$code lat=${lat}ms q=$qlines tmux=$tmux_ok fw=$fw_ok | $resp"
   fi
 }
 
@@ -240,6 +258,7 @@ need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1"; exit 1; }; }
 need ps
 need kill
 need nohup
+need grep
 
 is_running(){
   local pid="${1:-}"
@@ -333,7 +352,7 @@ CTL="$BASE_DIR/bin/heartbeatctl.sh"
 sleep 10
 termux-wake-lock 2>/dev/null || true
 
-# default interval 15s (edit if you want)
+# default interval 15s
 "$CTL" start 15 >/dev/null 2>&1 || true
 BOOT_EOF
 
