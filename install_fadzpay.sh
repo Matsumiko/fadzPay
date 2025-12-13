@@ -9,6 +9,9 @@ umask 077
 # - TMUX mode + WATCHDOG auto-restart
 # - wake-lock + optional root anti-doze
 # - boot via Termux:Boot (tmux + watchdog)
+# - QUEUE + RETRY + BACKOFF (anti miss when internet/server down)
+# - TTL queue (drop too-old pending items)
+# - NET-CHECK (skip flush when network really down)
 # =================================================
 
 RED='\033[0;31m'
@@ -22,7 +25,7 @@ print_header() {
   echo -e "${CYAN}"
   echo "╔══════════════════════════════════════════════════════╗"
   echo "║                 fadzPay Installer                    ║"
-  echo "║           GoPay Merchant Forwarder (TMUX)            ║"
+  echo "║      GoPay Merchant Forwarder (TMUX + Queue)         ║"
   echo "╚══════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 }
@@ -30,7 +33,6 @@ ok(){ echo -e "${GREEN}✓${NC} $1"; }
 warn(){ echo -e "${YELLOW}⚠${NC} $1"; }
 info(){ echo -e "${BLUE}ℹ${NC} $1"; }
 err(){ echo -e "${RED}✗${NC} $1"; }
-
 need_cmd(){ command -v "$1" >/dev/null 2>&1; }
 
 print_header
@@ -43,6 +45,7 @@ BIN_DIR="$BASE_DIR/bin"
 LOG_DIR="$BASE_DIR/logs"
 STATE_DIR="$BASE_DIR/state"
 CONF_DIR="$BASE_DIR/config"
+QUEUE_DIR="$BASE_DIR/queue"
 MARKER_FILE="$BASE_DIR/.fadzpay_installed_marker"
 
 TMUX_SESSION="fadzpay"
@@ -127,7 +130,7 @@ backup_or_remove_old_install
 # 4) Setup Directories
 # ============================================================================
 info "[4/8] Setting up directories..."
-mkdir -p "$BIN_DIR" "$LOG_DIR" "$STATE_DIR" "$CONF_DIR"
+mkdir -p "$BIN_DIR" "$LOG_DIR" "$STATE_DIR" "$CONF_DIR" "$QUEUE_DIR"
 touch "$MARKER_FILE"
 chmod 600 "$MARKER_FILE" 2>/dev/null || true
 ok "Prepared: $BASE_DIR"
@@ -138,9 +141,16 @@ ok "Prepared: $BASE_DIR"
 info "[5/8] Configuration setup..."
 echo
 
+# normalize base url (remove trailing slash)
+normalize_url() {
+  local u="$1"
+  while [[ "$u" == */ ]]; do u="${u%/}"; done
+  echo "$u"
+}
+
 while true; do
-  read -rp "$(echo -e ${CYAN}API_BASE_URL${NC}) (contoh: https://wb.domainkamu.id): " API_BASE
-  API_BASE="${API_BASE:-}"
+  read -rp "$(echo -e ${CYAN}API_BASE_URL${NC}) (contoh: https://domainkamu.id): " API_BASE
+  API_BASE="$(normalize_url "${API_BASE:-}")"
   if [ -z "$API_BASE" ]; then
     err "API_BASE_URL wajib diisi!"
   elif [[ ! "$API_BASE" =~ ^https?:// ]]; then
@@ -193,6 +203,28 @@ if ! [[ "$WATCHDOG_INTERVAL" =~ ^[0-9]+$ ]] || [ "$WATCHDOG_INTERVAL" -lt 5 ]; t
 fi
 ok "Watchdog interval: ${WATCHDOG_INTERVAL}s"
 
+# Queue tuning
+read -rp "$(echo -e ${CYAN}QUEUE_MAX_LINES${NC}) [default: 3000]: " QUEUE_MAX_LINES
+QUEUE_MAX_LINES="${QUEUE_MAX_LINES:-3000}"
+if ! [[ "$QUEUE_MAX_LINES" =~ ^[0-9]+$ ]] || [ "$QUEUE_MAX_LINES" -lt 200 ]; then
+  warn "QUEUE_MAX_LINES invalid, set to 3000"
+  QUEUE_MAX_LINES=3000
+fi
+ok "Queue max lines: ${QUEUE_MAX_LINES}"
+
+read -rp "$(echo -e ${CYAN}QUEUE_TTL_HOURS${NC}) (drop pending lewat TTL) [default: 48]: " QUEUE_TTL_HOURS
+QUEUE_TTL_HOURS="${QUEUE_TTL_HOURS:-48}"
+if ! [[ "$QUEUE_TTL_HOURS" =~ ^[0-9]+$ ]] || [ "$QUEUE_TTL_HOURS" -lt 1 ]; then
+  warn "QUEUE_TTL_HOURS invalid, set to 48"
+  QUEUE_TTL_HOURS=48
+fi
+ok "Queue TTL: ${QUEUE_TTL_HOURS} hours"
+
+read -rp "$(echo -e ${CYAN}NETCHECK_ENABLE${NC}) (skip flush jika net down) y/n [default: y]: " NETCHECK_ENABLE
+NETCHECK_ENABLE="${NETCHECK_ENABLE:-y}"
+[[ "$NETCHECK_ENABLE" =~ ^[Yy]$ ]] && NETCHECK_ENABLE="1" || NETCHECK_ENABLE="0"
+ok "Net-check: $([ "$NETCHECK_ENABLE" = "1" ] && echo enabled || echo disabled)"
+
 CONFIG_FILE="$CONF_DIR/config.env"
 cat > "$CONFIG_FILE" <<EOF
 # fadzPay Config (auto-generated)
@@ -204,6 +236,11 @@ INTERVAL_SEC='${INTERVAL_SEC}'
 MIN_AMOUNT='${MIN_AMOUNT}'
 WATCHDOG_INTERVAL='${WATCHDOG_INTERVAL}'
 TMUX_SESSION='${TMUX_SESSION}'
+
+# Queue features
+QUEUE_MAX_LINES='${QUEUE_MAX_LINES}'
+QUEUE_TTL_HOURS='${QUEUE_TTL_HOURS}'
+NETCHECK_ENABLE='${NETCHECK_ENABLE}'
 EOF
 chmod 600 "$CONFIG_FILE"
 ok "Saved config: $CONFIG_FILE (chmod 600)"
@@ -239,7 +276,7 @@ SCAN_EOF
 chmod +x "$BIN_DIR/scan_notifs.sh"
 ok "Created: scan_notifs.sh"
 
-# forwarder.sh
+# forwarder.sh (queue + retry + ttl + net-check)
 cat > "$BIN_DIR/forwarder.sh" <<'FORWARDER_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
@@ -247,8 +284,13 @@ umask 077
 
 BASE_DIR="__BASE_DIR__"
 CONFIG_FILE="$BASE_DIR/config/config.env"
+
 LOG_FILE="$BASE_DIR/logs/fadzpay-forwarder.log"
 STATE_FILE="$BASE_DIR/state/seen_fingerprints.txt"
+
+QUEUE_DIR="$BASE_DIR/queue"
+QUEUE_FILE="$QUEUE_DIR/pending.jsonl"
+QUEUE_TMP="$QUEUE_DIR/pending.tmp"
 
 STATE_MAX_LINES=7000
 MAX_AMOUNT=100000000
@@ -258,12 +300,12 @@ TITLE_REGEX='^Pembayaran diterima$'
 CONTENT_REGEX='Pembayaran[[:space:]]+QRIS[[:space:]]+Rp'
 
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "❌ Missing: $1"; exit 1; }; }
-need jq; need curl; need openssl; need awk; need grep; need sed; need sha256sum
+need jq; need curl; need openssl; need awk; need grep; need sed; need sha256sum; need wc; need tail; need mv; need mkdir
 need termux-notification-list; need termux-notification
 
-mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")"
-touch "$LOG_FILE" "$STATE_FILE"
-chmod 600 "$STATE_FILE" 2>/dev/null || true
+mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")" "$QUEUE_DIR"
+touch "$LOG_FILE" "$STATE_FILE" "$QUEUE_FILE"
+chmod 600 "$STATE_FILE" "$QUEUE_FILE" 2>/dev/null || true
 
 if [ ! -f "$CONFIG_FILE" ]; then
   echo "❌ Config missing: $CONFIG_FILE" | tee -a "$LOG_FILE"
@@ -273,18 +315,29 @@ fi
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
 
+API_BASE="${API_BASE%/}"
 WEBHOOK_URL="${API_BASE}/webhook/payment?token=${TOKEN}"
+
+QUEUE_MAX_LINES="${QUEUE_MAX_LINES:-3000}"
+QUEUE_TTL_HOURS="${QUEUE_TTL_HOURS:-48}"
+NETCHECK_ENABLE="${NETCHECK_ENABLE:-1}"
+
+TTL_MS=$(( QUEUE_TTL_HOURS * 60 * 60 * 1000 ))
 
 log(){ echo "$*" | tee -a "$LOG_FILE"; }
 
-trim_state(){
+trim_file_by_lines(){
+  local f="$1" max="$2"
   local lines keep
-  lines=$(wc -l < "$STATE_FILE" | tr -d ' ' || echo 0)
-  if [ "${lines:-0}" -gt "$STATE_MAX_LINES" ]; then
-    keep=$(( STATE_MAX_LINES * 8 / 10 ))
-    tail -n "$keep" "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+  lines="$(wc -l < "$f" | tr -d ' ' 2>/dev/null || echo 0)"
+  if [ "${lines:-0}" -gt "$max" ]; then
+    keep=$(( max * 80 / 100 ))
+    tail -n "$keep" "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
   fi
 }
+
+trim_state(){ trim_file_by_lines "$STATE_FILE" "$STATE_MAX_LINES"; }
+trim_queue(){ trim_file_by_lines "$QUEUE_FILE" "$QUEUE_MAX_LINES"; }
 
 extract_amount(){
   local s="$1" a
@@ -306,13 +359,13 @@ hmac_sig_hex(){
 
 post_json(){
   local body="$1"
-  local ts sig input
+  local ts sig input out
   ts="$(now_ms)"
   input="${ts}.${body}"
   sig="$(hmac_sig_hex "$input")"
 
-  curl -sS --max-time 12 --connect-timeout 6 \
-    --retry 2 --retry-delay 1 --retry-connrefused \
+  out="$(curl -sS --max-time 12 --connect-timeout 6 \
+    --retry 1 --retry-delay 1 --retry-connrefused \
     -H "Content-Type: application/json" \
     -H "X-Forwarder-Secret: ${SECRET}" \
     -H "X-Forwarder-Pin: ${PIN}" \
@@ -320,13 +373,121 @@ post_json(){
     -H "X-Signature: ${sig}" \
     -X POST "$WEBHOOK_URL" \
     --data-raw "$body" \
-    -w " HTTP=%{http_code}" 2>&1
+    -w " HTTP=%{http_code}" 2>&1 || true)"
+
+  echo "$out"
 }
 
+is_http_2xx(){ [[ "$1" =~ HTTP=2[0-9][0-9]$ ]]; }
+
+net_is_up(){
+  # Return 0 if we can reach API_BASE (any http code except 000), else 1
+  local code
+  code="$(curl -sS -I --max-time 5 --connect-timeout 4 "$API_BASE" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")"
+  [ "$code" != "000" ]
+}
+
+# ---- In-memory seen ----
 declare -A SEEN
 while read -r fp; do
   [ -n "$fp" ] && SEEN["$fp"]=1 || true
 done < <(tail -n 8000 "$STATE_FILE" 2>/dev/null || true)
+
+# ---- Queue push ----
+queue_push(){
+  local fingerprint="$1"
+  local payload="$2"
+  local now
+  now="$(now_ms)"
+  jq -nc \
+    --arg fp "$fingerprint" \
+    --argjson payload "$payload" \
+    --arg now "$now" \
+    '{fingerprint:$fp, payload:$payload, next_try_ms:($now|tonumber), attempts:0, created_ms:($now|tonumber)}' \
+    >> "$QUEUE_FILE"
+  trim_queue
+}
+
+# ---- Queue flush (retry pending) ----
+queue_flush(){
+  [ -s "$QUEUE_FILE" ] || return 0
+
+  if [ "$NETCHECK_ENABLE" = "1" ]; then
+    if ! net_is_up; then
+      # net down -> skip flush quietly
+      return 0
+    fi
+  fi
+
+  local now line fp payload next_try attempts created resp backoff new_next age
+  now="$(now_ms)"
+
+  : > "$QUEUE_TMP"
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+
+    fp="$(jq -r '.fingerprint // ""' <<<"$line" 2>/dev/null || echo "")"
+    payload="$(jq -c '.payload // empty' <<<"$line" 2>/dev/null || echo "")"
+    next_try="$(jq -r '.next_try_ms // 0' <<<"$line" 2>/dev/null || echo 0)"
+    attempts="$(jq -r '.attempts // 0' <<<"$line" 2>/dev/null || echo 0)"
+    created="$(jq -r '.created_ms // 0' <<<"$line" 2>/dev/null || echo 0)"
+
+    # if already seen -> drop
+    if [ -n "$fp" ] && [[ -n "${SEEN[$fp]:-}" ]]; then
+      continue
+    fi
+
+    # TTL drop
+    if [ "${created:-0}" -gt 0 ]; then
+      age=$(( now - created ))
+      if [ "$age" -gt "$TTL_MS" ]; then
+        log "⚠ [QUEUE] drop TTL | fp=${fp:0:10} | age_ms=$age"
+        continue
+      fi
+    fi
+
+    # not time yet -> keep
+    if [ "${next_try:-0}" -gt "$now" ]; then
+      echo "$line" >> "$QUEUE_TMP"
+      continue
+    fi
+
+    # broken item -> drop
+    [ -n "$payload" ] || continue
+
+    resp="$(post_json "$payload" || true)"
+
+    if is_http_2xx "$resp"; then
+      if [ -n "$fp" ]; then
+        SEEN["$fp"]=1
+        echo "$fp" >> "$STATE_FILE"
+        trim_state
+      fi
+      log "✓ [QUEUE] sent | fp=${fp:0:10} | ${resp}"
+      continue
+    fi
+
+    attempts=$(( attempts + 1 ))
+    backoff=$(( 5 * (2 ** (attempts - 1)) ))
+    [ "$backoff" -gt 600 ] && backoff=600
+    new_next=$(( now + backoff * 1000 ))
+
+    jq -nc \
+      --arg fp "$fp" \
+      --argjson payload "$payload" \
+      --argjson next_try_ms "$new_next" \
+      --argjson attempts "$attempts" \
+      --argjson created_ms "$created" \
+      '{fingerprint:$fp, payload:$payload, next_try_ms:$next_try_ms, attempts:$attempts, created_ms:$created_ms}' \
+      >> "$QUEUE_TMP"
+
+    log "✗ [QUEUE] failed | fp=${fp:0:10} | attempts=$attempts | retry_in=${backoff}s | ${resp:0:120}"
+  done < "$QUEUE_FILE"
+
+  mv "$QUEUE_TMP" "$QUEUE_FILE"
+  trim_queue
+}
 
 termux-wake-lock 2>/dev/null || true
 
@@ -343,20 +504,25 @@ termux-notification \
   --ongoing --priority low --alert-once 2>/dev/null || true
 
 log "════════════════════════════════════════════════════════════"
-log "  fadzPay Forwarder (GoPay Merchant)"
+log "  fadzPay Forwarder (GoPay Merchant) + Queue/TTL/NetCheck"
 log "════════════════════════════════════════════════════════════"
 log "▶️  Started: $(date '+%Y-%m-%d %H:%M:%S')"
 log "🎯 Target : $WEBHOOK_URL"
 log "⏱️  Interval: ${INTERVAL_SEC}s"
 log "💰 Min Amount: Rp ${MIN_AMOUNT}"
+log "📦 Queue file: $QUEUE_FILE (max_lines=$QUEUE_MAX_LINES, ttl_h=$QUEUE_TTL_HOURS)"
+log "🌐 Net-check: $([ "$NETCHECK_ENABLE" = "1" ] && echo enabled || echo disabled)"
 log "════════════════════════════════════════════════════════════"
 
 PROCESSED_COUNT=0
 ERROR_COUNT=0
+QUEUED_COUNT=0
 LAST_STATUS_PUSH=0
 STATUS_EVERY_MS=15000
 
 while :; do
+  queue_flush || true
+
   json="$(termux-notification-list 2>/dev/null || echo "[]")"
   if [ -z "$json" ] || [ "$json" = "null" ]; then
     sleep "$INTERVAL_SEC"
@@ -409,28 +575,31 @@ while :; do
     )"
 
     tslog="$(date '+%Y-%m-%d %H:%M:%S')"
-    resp="$(post_json "$payload" || echo "ERROR")"
+    resp="$(post_json "$payload" || true)"
 
-    SEEN["$fingerprint"]=1
-    echo "$fingerprint" >> "$STATE_FILE"
-    trim_state
-
-    if [[ "$resp" =~ HTTP=2[0-9][0-9]$ ]]; then
+    if is_http_2xx "$resp"; then
+      SEEN["$fingerprint"]=1
+      echo "$fingerprint" >> "$STATE_FILE"
+      trim_state
       log "✓ $tslog | Rp ${amt} | ${resp} | ${content:0:70}..."
       PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
     else
-      log "✗ $tslog | Rp ${amt} | FAILED: ${resp} | ${content:0:70}..."
+      queue_push "$fingerprint" "$payload"
+      log "✗ $tslog | Rp ${amt} | QUEUED | ${resp:0:120} | ${content:0:70}..."
       ERROR_COUNT=$((ERROR_COUNT + 1))
+      QUEUED_COUNT=$((QUEUED_COUNT + 1))
     fi
+
   done < <(jq -c '.[]' <<<"$json" 2>/dev/null || true)
 
   now="$(now_ms)"
   if [ $((now - LAST_STATUS_PUSH)) -ge "$STATUS_EVERY_MS" ]; then
     LAST_STATUS_PUSH="$now"
+    qlines="$(wc -l < "$QUEUE_FILE" | tr -d ' ' 2>/dev/null || echo 0)"
     termux-notification \
       --id walletfw \
       --title "fadzPay" \
-      --content "✓ ${PROCESSED_COUNT} | ✗ ${ERROR_COUNT} | $(date '+%H:%M:%S')" \
+      --content "✓ ${PROCESSED_COUNT} | ✗ ${ERROR_COUNT} | Q ${qlines} | $(date '+%H:%M:%S')" \
       --ongoing --priority low --alert-once 2>/dev/null || true
   fi
 
@@ -440,7 +609,7 @@ FORWARDER_EOF
 
 sed -i "s|__BASE_DIR__|$BASE_DIR|g" "$BIN_DIR/forwarder.sh"
 chmod +x "$BIN_DIR/forwarder.sh"
-ok "Created: forwarder.sh"
+ok "Created: forwarder.sh (Queue+TTL+NetCheck)"
 
 # forwarderctl.sh (tmux)
 cat > "$BIN_DIR/forwarderctl.sh" <<'CTL_EOF'
@@ -675,6 +844,7 @@ echo "  Restart: $BIN_DIR/forwarderctl.sh restart"
 echo "  Stop   : $BIN_DIR/forwarderctl.sh stop"
 echo "  Logs   : tail -f $BASE_DIR/logs/fadzpay-forwarder.log"
 echo "  Watchdog: tail -f $BASE_DIR/logs/fadzpay-watchdog.log"
+echo "  Queue  : wc -l $BASE_DIR/queue/pending.jsonl"
 echo
 echo -e "${CYAN}🚀 Auto-start:${NC} $BOOT_FILE"
 echo
