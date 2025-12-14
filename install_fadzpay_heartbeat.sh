@@ -10,7 +10,7 @@ err(){ echo -e "${RED}✗${NC} $1"; }
 
 echo -e "${CYAN}"
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║           fadzPay Heartbeat Installer (Addon)        ║"
+echo "║   fadzPay Heartbeat Installer (SAFE REINSTALL)       ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
@@ -18,9 +18,88 @@ BASE_DIR="$HOME/fadzpay"
 BIN_DIR="$BASE_DIR/bin"
 CONF_DIR="$BASE_DIR/config"
 FADZPAY_CONF="$CONF_DIR/config.env"
+
 HB_CONF="$CONF_DIR/heartbeat.env"
 BOOT_DIR="$HOME/.termux/boot"
 BOOT_FILE="$BOOT_DIR/fadzpay-heartbeat.sh"
+
+HB_SH="$BIN_DIR/heartbeat.sh"
+HB_CTL="$BIN_DIR/heartbeatctl.sh"
+
+STATE_DIR="$BASE_DIR/state"
+PID_FILE="$STATE_DIR/heartbeat.pid"
+UID_FILE="$STATE_DIR/device_uid"
+LOG_FILE="$BASE_DIR/logs/fadzpay-heartbeat.log"
+
+ts_now(){ date '+%Y%m%d-%H%M%S'; }
+
+safe_backup(){
+  # backup only heartbeat-related files if exists
+  local stamp="$1"
+  local bdir="$STATE_DIR/heartbeat-backup-$stamp"
+  mkdir -p "$bdir"
+
+  local any=0
+  for f in "$HB_CONF" "$HB_SH" "$HB_CTL" "$BOOT_FILE" "$PID_FILE" "$UID_FILE" "$LOG_FILE"; do
+    if [ -f "$f" ]; then
+      any=1
+      cp -f "$f" "$bdir/" 2>/dev/null || true
+    fi
+  done
+
+  if [ "$any" -eq 1 ]; then
+    ok "Backup heartbeat lama: $bdir"
+  else
+    info "Tidak ada file heartbeat lama untuk dibackup."
+    rmdir "$bdir" 2>/dev/null || true
+  fi
+}
+
+stop_old_heartbeat(){
+  # best-effort stop heartbeat daemon if running; only touches heartbeat pid / ctl
+  if [ -x "$HB_CTL" ]; then
+    "$HB_CTL" stop >/dev/null 2>&1 || true
+  fi
+
+  if [ -f "$PID_FILE" ]; then
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE" 2>/dev/null || true
+  fi
+}
+
+detect_existing(){
+  if [ -f "$HB_CONF" ] || [ -f "$HB_SH" ] || [ -f "$HB_CTL" ] || [ -f "$BOOT_FILE" ] || [ -f "$PID_FILE" ]; then
+    return 0
+  fi
+  return 1
+}
+
+remove_old_files_safe(){
+  # remove only heartbeat-related files; keep device_uid by default (optional)
+  rm -f "$HB_CONF" "$HB_SH" "$HB_CTL" "$BOOT_FILE" "$PID_FILE" 2>/dev/null || true
+}
+
+reset_uid_prompt(){
+  # ask user whether to reset device_uid (optional)
+  if [ -f "$UID_FILE" ]; then
+    echo
+    warn "Ditemukan UID lama: $UID_FILE (ini bikin device_id stabil)."
+    read -rp "$(echo -e ${CYAN}Reset device UID?${NC}) (y/N): " ans
+    ans="${ans:-N}"
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+      rm -f "$UID_FILE" 2>/dev/null || true
+      ok "device_uid direset (akan generate UID baru)."
+    else
+      ok "device_uid dipertahankan (recommended)."
+    fi
+  fi
+}
 
 info "[1/5] Install dependencies..."
 pkg update -y >/dev/null 2>&1 || true
@@ -33,8 +112,24 @@ if [ ! -d "$BASE_DIR" ]; then
   exit 1
 fi
 
-mkdir -p "$BIN_DIR" "$BOOT_DIR" "$BASE_DIR/logs" "$BASE_DIR/state"
+mkdir -p "$BIN_DIR" "$BOOT_DIR" "$BASE_DIR/logs" "$STATE_DIR"
 ok "Dirs ready"
+
+# -------------------------------------------------------------------
+# SAFE REINSTALL: stop + backup + remove old heartbeat files only
+# -------------------------------------------------------------------
+if detect_existing; then
+  echo
+  warn "Heartbeat lama terdeteksi. Akan dilakukan SAFE REINSTALL (stop + backup + replace)."
+  stamp="$(ts_now)"
+  stop_old_heartbeat
+  safe_backup "$stamp"
+  reset_uid_prompt
+  remove_old_files_safe
+  ok "Heartbeat lama dibersihkan (hanya file heartbeat)."
+else
+  info "Tidak ada heartbeat lama, lanjut install fresh."
+fi
 
 # -------------------------------------------------------------------
 # INPUT CONFIG HEARTBEAT
@@ -57,8 +152,8 @@ while true; do
   fi
 done
 
-# DEVICE_NAME (baru)
-read -rp "$(echo -e ${CYAN}DEVICE_NAME${NC}) (contoh: dev-1 / backup-2) [default: android]: " DEVICE_NAME
+# DEVICE_NAME
+read -rp "$(echo -e ${CYAN}DEVICE_NAME${NC}) (wajib unik per device, contoh: dev-1 / backup-2) [default: android]: " DEVICE_NAME
 DEVICE_NAME="${DEVICE_NAME:-android}"
 ok "DEVICE_NAME set: $DEVICE_NAME"
 
@@ -66,15 +161,26 @@ ok "DEVICE_NAME set: $DEVICE_NAME"
 while true; do
   read -rsp "$(echo -e ${CYAN}STATUS_PIN${NC}) (harus sama dengan env.STATUS_PIN di Worker): " STATUS_PIN
   echo
-  if [ -z "${STATUS_PIN:-}" ]; then err "STATUS_PIN wajib diisi!"; else ok "PIN configured"; break; fi
+  if [ -z "${STATUS_PIN:-}" ]; then
+    err "STATUS_PIN wajib diisi!"
+  else
+    ok "PIN configured"
+    break
+  fi
 done
 
-# SECRET
-DEFAULT_SECRET="$(openssl rand -hex 16 2>/dev/null || echo "changeme")"
-read -rsp "$(echo -e ${CYAN}STATUS_SECRET${NC}) [default: auto-generated]: " STATUS_SECRET
-echo
-STATUS_SECRET="${STATUS_SECRET:-$DEFAULT_SECRET}"
-ok "Secret set (${#STATUS_SECRET} chars)"
+# SECRET (wajib sama dengan Worker)
+while true; do
+  echo -e "${YELLOW}NOTE:${NC} STATUS_SECRET ini HARUS sama persis dengan env.STATUS_SECRET di Worker (copy-paste)."
+  read -rsp "$(echo -e ${CYAN}STATUS_SECRET${NC}) (wajib sama dengan Worker): " STATUS_SECRET
+  echo
+  if [ -z "${STATUS_SECRET:-}" ]; then
+    err "STATUS_SECRET wajib diisi (jangan kosong)!"
+  else
+    ok "Secret configured (${#STATUS_SECRET} chars)"
+    break
+  fi
+done
 
 # INTERVAL
 read -rp "$(echo -e ${CYAN}HEARTBEAT_INTERVAL${NC}) detik [default: 15]: " HEARTBEAT_INTERVAL
@@ -109,8 +215,8 @@ ok "Saved heartbeat config: $HB_CONF (chmod 600)"
 # -------------------------------------------------------------------
 # WRITE heartbeat.sh
 # -------------------------------------------------------------------
-info "[3/5] Writing heartbeat.sh ..."
-cat > "$BIN_DIR/heartbeat.sh" <<'HB_EOF'
+info "[3/5] Writing heartbeat.sh (FIXED DEVICE_ID) ..."
+cat > "$HB_SH" <<'HB_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
 umask 077
@@ -118,8 +224,10 @@ umask 077
 BASE_DIR="$HOME/fadzpay"
 CONF="$BASE_DIR/config/heartbeat.env"
 LOG="$BASE_DIR/logs/fadzpay-heartbeat.log"
+STATE_DIR="$BASE_DIR/state"
+UID_FILE="$STATE_DIR/device_uid"   # persist unique uid per device
 
-mkdir -p "$BASE_DIR/logs" "$BASE_DIR/state"
+mkdir -p "$BASE_DIR/logs" "$STATE_DIR"
 touch "$LOG"
 
 log(){ echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
@@ -144,13 +252,27 @@ DEVICE_MODEL="$(getprop ro.product.model 2>/dev/null || echo "android")"
 ANDROID_VER="$(getprop ro.build.version.release 2>/dev/null || echo "-")"
 DEVICE_NAME="${DEVICE_NAME:-android}"
 
-RAW_SERIAL="$(getprop ro.serialno 2>/dev/null || echo "unknown")"
-DEVICE_ID="$(printf '%s' "${RAW_SERIAL}|${STATUS_SECRET}" | sha256sum | awk '{print $1}' | cut -c1-12)"
+# stable per-device UID (avoid collision even if serial unknown)
+if [ -f "$UID_FILE" ]; then
+  DEVICE_UID="$(cat "$UID_FILE" 2>/dev/null | tr -d '\r\n' || true)"
+fi
+
+if [ -z "${DEVICE_UID:-}" ]; then
+  DEVICE_UID="$(openssl rand -hex 8 2>/dev/null || date +%s%N | sha256sum | awk '{print $1}' | cut -c1-16)"
+  printf '%s\n' "$DEVICE_UID" > "$UID_FILE"
+  chmod 600 "$UID_FILE" || true
+fi
+
+DEVICE_ID="$(printf '%s' "${DEVICE_NAME}|${DEVICE_UID}" | sha256sum | awk '{print $1}' | cut -c1-12)"
 
 now_ms(){
   local t
   t="$(date +%s%3N 2>/dev/null || true)"
-  if [ -n "$t" ] && [[ "$t" =~ ^[0-9]+$ ]]; then echo "$t"; else echo $(( $(date +%s) * 1000 )); fi
+  if [ -n "$t" ] && [[ "$t" =~ ^[0-9]+$ ]]; then
+    echo "$t"
+  else
+    echo $(( $(date +%s) * 1000 ))
+  fi
 }
 
 hmac_sig_hex(){
@@ -216,6 +338,7 @@ send_once(){
     --arg android "$ANDROID_VER" \
     --arg device_id "$DEVICE_ID" \
     --arg device_name "$DEVICE_NAME" \
+    --arg device_uid "$DEVICE_UID" \
     --arg base "$STATUS_BASE_URL" \
     --arg http_code "$code" \
     --arg latency_ms "$lat" \
@@ -226,7 +349,7 @@ send_once(){
     --arg ts "$ts" \
     '{
       app:$app,
-      device:{model:$model, android:$android, id:$device_id, name:$device_name},
+      device:{model:$model, android:$android, id:$device_id, name:$device_name, uid:$device_uid},
       status_base:$base,
       probe:{http_code:($http_code|tonumber), latency_ms:($latency_ms|tonumber)},
       forwarder:{tmux_running:($tmux_ok|tonumber), running:($fw_ok|tonumber)},
@@ -249,9 +372,9 @@ send_once(){
     -w " HTTP=%{http_code}" 2>&1 || true)"
 
   if [[ "$resp" =~ HTTP=2[0-9][0-9]$ ]]; then
-    log "HB OK | name=$DEVICE_NAME id=$DEVICE_ID | probe=$code lat=${lat}ms tmux=$tmux_ok fw=$fw_ok | $resp"
+    log "HB OK | name=$DEVICE_NAME id=$DEVICE_ID uid=$DEVICE_UID | probe=$code lat=${lat}ms tmux=$tmux_ok fw=$fw_ok | $resp"
   else
-    log "HB FAIL | name=$DEVICE_NAME id=$DEVICE_ID | probe=$code lat=${lat}ms tmux=$tmux_ok fw=$fw_ok | $resp"
+    log "HB FAIL | name=$DEVICE_NAME id=$DEVICE_ID uid=$DEVICE_UID | probe=$code lat=${lat}ms tmux=$tmux_ok fw=$fw_ok | $resp"
   fi
 }
 
@@ -279,14 +402,14 @@ case "${1:-}" in
 esac
 HB_EOF
 
-chmod +x "$BIN_DIR/heartbeat.sh"
-ok "Installed: $BIN_DIR/heartbeat.sh"
+chmod +x "$HB_SH"
+ok "Installed: $HB_SH"
 
 # -------------------------------------------------------------------
-# WRITE heartbeatctl.sh
+# WRITE heartbeatctl.sh (unchanged)
 # -------------------------------------------------------------------
 info "[4/5] Writing heartbeatctl.sh ..."
-cat > "$BIN_DIR/heartbeatctl.sh" <<'CTL_EOF'
+cat > "$HB_CTL" <<'CTL_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
 umask 077
@@ -388,8 +511,8 @@ case "${1:-}" in
 esac
 CTL_EOF
 
-chmod +x "$BIN_DIR/heartbeatctl.sh"
-ok "Installed: $BIN_DIR/heartbeatctl.sh"
+chmod +x "$HB_CTL"
+ok "Installed: $HB_CTL"
 
 # -------------------------------------------------------------------
 # BOOT SCRIPT
