@@ -17,12 +17,10 @@ echo -e "${NC}"
 BASE_DIR="$HOME/fadzpay"
 BIN_DIR="$BASE_DIR/bin"
 CONF_DIR="$BASE_DIR/config"
-FADZPAY_CONF="$CONF_DIR/config.env"              # optional (buat baca TMUX_SESSION kalau ada)
-HB_CONF="$CONF_DIR/heartbeat.env"                # ✅ heartbeat config terpisah
+FADZPAY_CONF="$CONF_DIR/config.env"
+HB_CONF="$CONF_DIR/heartbeat.env"
 BOOT_DIR="$HOME/.termux/boot"
 BOOT_FILE="$BOOT_DIR/fadzpay-heartbeat.sh"
-
-need_cmd(){ command -v "$1" >/dev/null 2>&1; }
 
 info "[1/5] Install dependencies..."
 pkg update -y >/dev/null 2>&1 || true
@@ -39,7 +37,7 @@ mkdir -p "$BIN_DIR" "$BOOT_DIR" "$BASE_DIR/logs" "$BASE_DIR/state"
 ok "Dirs ready"
 
 # -------------------------------------------------------------------
-# INPUT CONFIG HEARTBEAT (TERPISAH)
+# INPUT CONFIG HEARTBEAT
 # -------------------------------------------------------------------
 info "[2/5] Setup Heartbeat config..."
 echo
@@ -53,12 +51,16 @@ while true; do
   elif [[ ! "$STATUS_BASE_URL" =~ ^https?:// ]]; then
     err "Harus diawali http:// atau https://"
   else
-    # trim trailing slash
     STATUS_BASE_URL="${STATUS_BASE_URL%/}"
     ok "STATUS_BASE_URL set: $STATUS_BASE_URL"
     break
   fi
 done
+
+# DEVICE_NAME (baru)
+read -rp "$(echo -e ${CYAN}DEVICE_NAME${NC}) (contoh: dev-1 / backup-2) [default: android]: " DEVICE_NAME
+DEVICE_NAME="${DEVICE_NAME:-android}"
+ok "DEVICE_NAME set: $DEVICE_NAME"
 
 # PIN
 while true; do
@@ -91,10 +93,11 @@ if [ -f "$FADZPAY_CONF" ]; then
   TMUX_SESSION="${TMUX_SESSION:-fadzpay}"
 fi
 
-# Save heartbeat config (chmod 600)
+# Save heartbeat config
 cat > "$HB_CONF" <<EOF
 # fadzPay Heartbeat Config (auto-generated)
 STATUS_BASE_URL='${STATUS_BASE_URL}'
+DEVICE_NAME='${DEVICE_NAME}'
 STATUS_PIN='${STATUS_PIN}'
 STATUS_SECRET='${STATUS_SECRET}'
 HEARTBEAT_INTERVAL='${HEARTBEAT_INTERVAL}'
@@ -122,15 +125,7 @@ touch "$LOG"
 log(){ echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
 need(){ command -v "$1" >/dev/null 2>&1 || { log "Missing: $1"; exit 1; }; }
 
-need curl
-need jq
-need openssl
-need awk
-need sed
-need date
-need wc
-need tr
-need sha256sum
+need curl; need jq; need openssl; need awk; need sed; need date; need wc; need tr; need sha256sum
 
 if [ ! -f "$CONF" ]; then
   log "Heartbeat config not found: $CONF"
@@ -141,16 +136,14 @@ fi
 source "$CONF"
 
 STATUS_BASE_URL="${STATUS_BASE_URL%/}"
-
-# Worker kamu:
-STATUS_URL="${STATUS_BASE_URL}/status/heartbeat"   # secured push (headers)
-STATUS_VIEW="${STATUS_BASE_URL}/"                  # public page
-PROBE_URL="${STATUS_BASE_URL}/health"              # stable probe
+STATUS_URL="${STATUS_BASE_URL}/status/heartbeat"
+STATUS_VIEW="${STATUS_BASE_URL}/"
+PROBE_URL="${STATUS_BASE_URL}/health"
 
 DEVICE_MODEL="$(getprop ro.product.model 2>/dev/null || echo "android")"
 ANDROID_VER="$(getprop ro.build.version.release 2>/dev/null || echo "-")"
+DEVICE_NAME="${DEVICE_NAME:-android}"
 
-# ✅ Public-safe device id: hash(serial|secret) -> 12 chars
 RAW_SERIAL="$(getprop ro.serialno 2>/dev/null || echo "unknown")"
 DEVICE_ID="$(printf '%s' "${RAW_SERIAL}|${STATUS_SECRET}" | sha256sum | awk '{print $1}' | cut -c1-12)"
 
@@ -166,7 +159,6 @@ hmac_sig_hex(){
 }
 
 http_probe(){
-  # returns "CODE LAT_MS"
   local url="$1" out code tt lat
   out="$(curl -sS -o /dev/null -w "%{http_code} %{time_total}" --connect-timeout 4 --max-time 6 "$url" 2>/dev/null || echo "000 0")"
   code="$(awk '{print $1}' <<<"$out")"
@@ -223,6 +215,7 @@ send_once(){
     --arg model "$DEVICE_MODEL" \
     --arg android "$ANDROID_VER" \
     --arg device_id "$DEVICE_ID" \
+    --arg device_name "$DEVICE_NAME" \
     --arg base "$STATUS_BASE_URL" \
     --arg http_code "$code" \
     --arg latency_ms "$lat" \
@@ -233,7 +226,7 @@ send_once(){
     --arg ts "$ts" \
     '{
       app:$app,
-      device:{model:$model, android:$android, id:$device_id},
+      device:{model:$model, android:$android, id:$device_id, name:$device_name},
       status_base:$base,
       probe:{http_code:($http_code|tonumber), latency_ms:($latency_ms|tonumber)},
       forwarder:{tmux_running:($tmux_ok|tonumber), running:($fw_ok|tonumber)},
@@ -256,9 +249,9 @@ send_once(){
     -w " HTTP=%{http_code}" 2>&1 || true)"
 
   if [[ "$resp" =~ HTTP=2[0-9][0-9]$ ]]; then
-    log "HB OK | probe=$code lat=${lat}ms tmux=$tmux_ok fw=$fw_ok | $resp"
+    log "HB OK | name=$DEVICE_NAME id=$DEVICE_ID | probe=$code lat=${lat}ms tmux=$tmux_ok fw=$fw_ok | $resp"
   else
-    log "HB FAIL | probe=$code lat=${lat}ms tmux=$tmux_ok fw=$fw_ok | $resp"
+    log "HB FAIL | name=$DEVICE_NAME id=$DEVICE_ID | probe=$code lat=${lat}ms tmux=$tmux_ok fw=$fw_ok | $resp"
   fi
 }
 
@@ -305,10 +298,7 @@ PID_FILE="$BASE_DIR/state/heartbeat.pid"
 LOG="$BASE_DIR/logs/fadzpay-heartbeat.log"
 
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1"; exit 1; }; }
-need ps
-need kill
-need nohup
-need grep
+need ps; need kill; need nohup; need grep
 
 interval_default(){
   if [ -f "$CONF" ]; then
@@ -414,7 +404,6 @@ CTL="$BASE_DIR/bin/heartbeatctl.sh"
 
 sleep 10
 termux-wake-lock 2>/dev/null || true
-
 "$CTL" start >/dev/null 2>&1 || true
 BOOT_EOF
 
