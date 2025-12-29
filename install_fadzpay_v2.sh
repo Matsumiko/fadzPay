@@ -1,25 +1,21 @@
 #!/data/data/com.termux/files/usr/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 umask 077
 
 # =================================================
 # fadzPay (Termux) - GoPay Merchant Notification Forwarder
-# - Smart reinstall: detect old install, stop+cleanup, reinstall fresh
-# - Safe: if BASE_DIR exists but not created by this installer -> auto backup rename
-# - TMUX mode + WATCHDOG auto-restart
-# - wake-lock + optional root anti-doze
-# - boot via Termux:Boot (tmux + watchdog)
-# - QUEUE + RETRY + BACKOFF (anti miss when internet/server down)
-# - TTL queue (drop too-old pending items)
-# - NET-CHECK (skip flush when network really down)
-# - QUEUE DEDUPE (anti duplicate queue when offline)
-# - INTERVAL_SEC supports float (e.g. 0.5)
-# - DEVICE_ID (manual or auto UUID) -> sent to worker
+# Optimized + Samsung/OEM anti-boomerang edition
 #
-# IMPORTANT UPDATE:
-# - SECRET sekarang WAJIB diisi dan HARUS sama persis dengan SECRET di Worker (env.SECRET)
-#   agar signature valid di semua device (3 device backup).
-# - Payload sekarang mengirim event_ms numeric (ms epoch) agar dedupe bucket Worker stabil.
+# Key upgrades:
+# - termux-notification-list: timeout + retry + auto-heal (root) if service goes null
+# - Root helper: start Termux:API KeepAliveService + allow_listener NotificationListener
+# - Watchdog: heartbeat stale detection (detect hang, not only tmux session)
+# - Parsing: single jq pass per poll (lower CPU)
+# - Safer: handles JSON error objects from Termux:API
+#
+# NOTE:
+# - Root features are optional (best effort). If no root, it still runs.
+# - Keep secrets safe. Don't share TOKEN/SECRET/PIN.
 # =================================================
 
 RED='\033[0;31m'
@@ -29,19 +25,29 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+INSTALLER_VERSION="2025.12.29"
+
 print_header() {
   echo -e "${CYAN}"
   echo "╔══════════════════════════════════════════════════════╗"
   echo "║                 fadzPay Installer                    ║"
-  echo "║      GoPay Merchant Forwarder (TMUX + Queue)         ║"
+  echo "║     GoPay Merchant Forwarder (TMUX + Queue + Heal)   ║"
+  echo "║                 v${INSTALLER_VERSION}                         ║"
   echo "╚══════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 }
+
 ok(){ echo -e "${GREEN}✓${NC} $1"; }
 warn(){ echo -e "${YELLOW}⚠${NC} $1"; }
 info(){ echo -e "${BLUE}ℹ${NC} $1"; }
 err(){ echo -e "${RED}✗${NC} $1"; }
+
 need_cmd(){ command -v "$1" >/dev/null 2>&1; }
+
+die(){
+  err "$1"
+  exit 1
+}
 
 print_header
 
@@ -61,6 +67,10 @@ BOOT_FILE="${HOME}/.termux/boot/fadzpay.sh"
 
 AUTO_YES="${AUTO_YES:-0}"   # AUTO_YES=1 ./install_fadzpay.sh
 
+# Termux:API NotificationListener component (from Termux:API manifest)
+# service android:name=".apis.NotificationListAPI$NotificationService"
+TERMUX_API_NL_COMPONENT='com.termux.api/com.termux.api.apis.NotificationListAPI$NotificationService'
+
 stop_everything_best_effort() {
   info "Stopping existing services (best effort)..."
 
@@ -70,12 +80,15 @@ stop_everything_best_effort() {
 
   pkill -f "$BASE_DIR/bin/watchdog.sh" 2>/dev/null || true
   pkill -f "$BASE_DIR/bin/forwarder.sh" 2>/dev/null || true
+  pkill -f "$BASE_DIR/bin/notif_keeper.sh" 2>/dev/null || true
 
   rm -f "$STATE_DIR/forwarder.pid" 2>/dev/null || true
   rm -f "$STATE_DIR/watchdog.pid" 2>/dev/null || true
+  rm -f "$STATE_DIR/notif_keeper.pid" 2>/dev/null || true
 
   termux-notification-remove walletfw 2>/dev/null || true
   termux-notification-remove walletwd 2>/dev/null || true
+  termux-notification-remove walletnk 2>/dev/null || true
   termux-wake-unlock 2>/dev/null || true
 
   ok "Stop step done"
@@ -103,10 +116,9 @@ backup_or_remove_old_install() {
   fi
 }
 
-# Generate device id (UUID)
 gen_device_id() {
   if [ -r /proc/sys/kernel/random/uuid ]; then
-    cat /proc/sys/kernel/random/uuid | tr -d '\n'
+    tr -d '\n' < /proc/sys/kernel/random/uuid
     return 0
   fi
   local a
@@ -114,14 +126,20 @@ gen_device_id() {
   echo "${a:0:8}-${a:8:4}-${a:12:4}-${a:16:4}-${a:20:12}"
 }
 
+normalize_url() {
+  local u="$1"
+  while [[ "$u" == */ ]]; do u="${u%/}"; done
+  echo "$u"
+}
+
 # ============================================================================
 # 1) Update & Install Dependencies
 # ============================================================================
-info "[1/8] Updating packages..."
-pkg update -y >/dev/null 2>&1 && ok "Package index updated" || true
-pkg upgrade -y >/dev/null 2>&1 && ok "Packages upgraded" || true
+info "[1/9] Updating packages..."
+pkg update -y >/dev/null 2>&1 && ok "Package index updated" || warn "pkg update failed (skip)"
+pkg upgrade -y >/dev/null 2>&1 && ok "Packages upgraded" || warn "pkg upgrade failed (skip)"
 
-info "[2/8] Installing dependencies..."
+info "[2/9] Installing dependencies..."
 PACKAGES=(curl jq coreutils grep sed openssl-tool gawk procps termux-api tmux)
 for p in "${PACKAGES[@]}"; do
   if pkg install -y "$p" >/dev/null 2>&1; then ok "Installed: $p"; else warn "Failed install: $p (maybe already)"; fi
@@ -131,7 +149,7 @@ if ! need_cmd termux-notification-list; then
   echo
   err "termux-notification-list tidak ditemukan!"
   echo -e "${YELLOW}Wajib:${NC}"
-  echo "1) Install Termux:API (F-Droid)"
+  echo "1) Install Termux:API (F-Droid / sumber yang sama dengan Termux)"
   echo "2) Buka Termux:API sekali"
   echo "3) Settings → Apps → Special access → Notification access → enable Termux:API"
   echo
@@ -142,13 +160,13 @@ fi
 # ============================================================================
 # 3) Smart Reinstall Detect
 # ============================================================================
-info "[3/8] Smart install detector..."
+info "[3/9] Smart install detector..."
 backup_or_remove_old_install
 
 # ============================================================================
 # 4) Setup Directories
 # ============================================================================
-info "[4/8] Setting up directories..."
+info "[4/9] Setting up directories..."
 mkdir -p "$BIN_DIR" "$LOG_DIR" "$STATE_DIR" "$CONF_DIR" "$QUEUE_DIR"
 touch "$MARKER_FILE"
 chmod 600 "$MARKER_FILE" 2>/dev/null || true
@@ -157,14 +175,8 @@ ok "Prepared: $BASE_DIR"
 # ============================================================================
 # 5) Configuration Input
 # ============================================================================
-info "[5/8] Configuration setup..."
+info "[5/9] Configuration setup..."
 echo
-
-normalize_url() {
-  local u="$1"
-  while [[ "$u" == */ ]]; do u="${u%/}"; done
-  echo "$u"
-}
 
 while true; do
   read -rp "$(echo -e ${CYAN}API_BASE_URL${NC}) (contoh: https://domainkamu.id): " API_BASE
@@ -185,18 +197,11 @@ while true; do
   if [ -z "${TOKEN:-}" ]; then err "TOKEN wajib diisi!"; else ok "Token configured (${#TOKEN} chars)"; break; fi
 done
 
-# ✅ UPDATE: SECRET wajib (JANGAN auto-random per device)
-echo -e "${YELLOW}NOTE:${NC} SECRET harus sama persis dengan env.SECRET di Worker, dan sama di semua device."
-while true; do
-  read -rsp "$(echo -e ${CYAN}SECRET${NC}) (HARUS sama dengan SECRET di Worker): " SECRET
-  echo
-  if [ -z "${SECRET:-}" ]; then
-    err "SECRET wajib diisi!"
-  else
-    ok "Secret set (${#SECRET} chars)"
-    break
-  fi
-done
+DEFAULT_SECRET="$(openssl rand -hex 16 2>/dev/null || echo "changeme")"
+read -rsp "$(echo -e ${CYAN}SECRET${NC}) [default: auto-generated]: " SECRET
+echo
+SECRET="${SECRET:-$DEFAULT_SECRET}"
+ok "Secret set (${#SECRET} chars)"
 
 DEFAULT_PIN="123456"
 read -rsp "$(echo -e ${CYAN}PIN${NC}) [default: $DEFAULT_PIN]: " PIN
@@ -204,13 +209,11 @@ echo
 PIN="${PIN:-$DEFAULT_PIN}"
 ok "PIN configured"
 
-# ✅ DEVICE_ID prompt (enter = auto UUID)
 DEFAULT_DEVICE_ID="$(gen_device_id)"
 read -rp "$(echo -e ${CYAN}DEVICE_ID${NC}) (opsional, contoh: S8-WIFI / S8-PLUS-DATA) [enter=auto]: " DEVICE_ID
 DEVICE_ID="${DEVICE_ID:-$DEFAULT_DEVICE_ID}"
 ok "Device ID: ${DEVICE_ID}"
 
-# ✅ float interval support
 read -rp "$(echo -e ${CYAN}INTERVAL_SEC${NC}) (boleh float, contoh 0.5) [default: 0.5]: " INTERVAL_SEC
 INTERVAL_SEC="${INTERVAL_SEC:-0.5}"
 if ! [[ "$INTERVAL_SEC" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
@@ -239,6 +242,14 @@ if ! [[ "$WATCHDOG_INTERVAL" =~ ^[0-9]+$ ]] || [ "$WATCHDOG_INTERVAL" -lt 5 ]; t
 fi
 ok "Watchdog interval: ${WATCHDOG_INTERVAL}s"
 
+read -rp "$(echo -e ${CYAN}HEARTBEAT_STALE_SEC${NC}) watchdog restart kalau forwarder ngehang (detik) [default: 90]: " HEARTBEAT_STALE_SEC
+HEARTBEAT_STALE_SEC="${HEARTBEAT_STALE_SEC:-90}"
+if ! [[ "$HEARTBEAT_STALE_SEC" =~ ^[0-9]+$ ]] || [ "$HEARTBEAT_STALE_SEC" -lt 30 ]; then
+  warn "HEARTBEAT_STALE_SEC invalid, set to 90"
+  HEARTBEAT_STALE_SEC=90
+fi
+ok "Heartbeat stale: ${HEARTBEAT_STALE_SEC}s"
+
 read -rp "$(echo -e ${CYAN}QUEUE_MAX_LINES${NC}) [default: 3000]: " QUEUE_MAX_LINES
 QUEUE_MAX_LINES="${QUEUE_MAX_LINES:-3000}"
 if ! [[ "$QUEUE_MAX_LINES" =~ ^[0-9]+$ ]] || [ "$QUEUE_MAX_LINES" -lt 200 ]; then
@@ -260,6 +271,65 @@ NETCHECK_ENABLE="${NETCHECK_ENABLE:-y}"
 [[ "$NETCHECK_ENABLE" =~ ^[Yy]$ ]] && NETCHECK_ENABLE="1" || NETCHECK_ENABLE="0"
 ok "Net-check: $([ "$NETCHECK_ENABLE" = "1" ] && echo enabled || echo disabled)"
 
+# Default regex lebih toleran (banyak OEM/app notif beda2 spasi/tanda baca)
+DEFAULT_TITLE_REGEX='Pembayaran[[:space:]]+diterima'
+DEFAULT_CONTENT_REGEX='QRIS.*[Rr][Pp][[:space:]]*[0-9]'
+read -rp "$(echo -e ${CYAN}TITLE_REGEX${NC}) (grep -E) [default: $DEFAULT_TITLE_REGEX]: " TITLE_REGEX
+TITLE_REGEX="${TITLE_REGEX:-$DEFAULT_TITLE_REGEX}"
+ok "TITLE_REGEX: $TITLE_REGEX"
+
+read -rp "$(echo -e ${CYAN}CONTENT_REGEX${NC}) (grep -E) [default: $DEFAULT_CONTENT_REGEX]: " CONTENT_REGEX
+CONTENT_REGEX="${CONTENT_REGEX:-$DEFAULT_CONTENT_REGEX}"
+ok "CONTENT_REGEX: $CONTENT_REGEX"
+
+DEFAULT_ALLOW_PACKAGES='com.gojek.gopaymerchant'
+read -rp "$(echo -e ${CYAN}ALLOW_PACKAGES${NC}) (comma-separated) [default: $DEFAULT_ALLOW_PACKAGES]: " ALLOW_PACKAGES
+ALLOW_PACKAGES="${ALLOW_PACKAGES:-$DEFAULT_ALLOW_PACKAGES}"
+ok "Allow packages: $ALLOW_PACKAGES"
+
+# Notif fetch robust knobs
+read -rp "$(echo -e ${CYAN}NOTIF_CMD_TIMEOUT${NC}) timeout termux-notification-list (detik) [default: 4]: " NOTIF_CMD_TIMEOUT
+NOTIF_CMD_TIMEOUT="${NOTIF_CMD_TIMEOUT:-4}"
+if ! [[ "$NOTIF_CMD_TIMEOUT" =~ ^[0-9]+$ ]] || [ "$NOTIF_CMD_TIMEOUT" -lt 2 ]; then
+  warn "NOTIF_CMD_TIMEOUT invalid, set to 4"
+  NOTIF_CMD_TIMEOUT=4
+fi
+ok "Notif cmd timeout: ${NOTIF_CMD_TIMEOUT}s"
+
+read -rp "$(echo -e ${CYAN}NOTIF_RETRY_COUNT${NC}) retry saat notif list error [default: 3]: " NOTIF_RETRY_COUNT
+NOTIF_RETRY_COUNT="${NOTIF_RETRY_COUNT:-3}"
+if ! [[ "$NOTIF_RETRY_COUNT" =~ ^[0-9]+$ ]] || [ "$NOTIF_RETRY_COUNT" -lt 1 ] || [ "$NOTIF_RETRY_COUNT" -gt 10 ]; then
+  warn "NOTIF_RETRY_COUNT invalid, set to 3"
+  NOTIF_RETRY_COUNT=3
+fi
+ok "Notif retry count: ${NOTIF_RETRY_COUNT}"
+
+read -rp "$(echo -e ${CYAN}NOTIF_RETRY_DELAY${NC}) jeda antar retry (boleh float) [default: 0.2]: " NOTIF_RETRY_DELAY
+NOTIF_RETRY_DELAY="${NOTIF_RETRY_DELAY:-0.2}"
+if ! [[ "$NOTIF_RETRY_DELAY" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  warn "NOTIF_RETRY_DELAY invalid, set to 0.2"
+  NOTIF_RETRY_DELAY="0.2"
+fi
+ok "Notif retry delay: ${NOTIF_RETRY_DELAY}s"
+
+# Root heal options (anti boomerang)
+ROOT_HEAL_ENABLE_DEFAULT="1"
+TERMUX_API_KEEPALIVE_ENABLE_DEFAULT="1"
+if ! command -v su >/dev/null 2>&1; then
+  ROOT_HEAL_ENABLE_DEFAULT="0"
+  TERMUX_API_KEEPALIVE_ENABLE_DEFAULT="0"
+fi
+
+read -rp "$(echo -e ${CYAN}ROOT_HEAL_ENABLE${NC}) auto-heal notif listener (root) y/n [default: $([ "$ROOT_HEAL_ENABLE_DEFAULT" = "1" ] && echo y || echo n)]: " ROOT_HEAL_ENABLE_IN
+ROOT_HEAL_ENABLE_IN="${ROOT_HEAL_ENABLE_IN:-$([ "$ROOT_HEAL_ENABLE_DEFAULT" = "1" ] && echo y || echo n)}"
+[[ "$ROOT_HEAL_ENABLE_IN" =~ ^[Yy]$ ]] && ROOT_HEAL_ENABLE="1" || ROOT_HEAL_ENABLE="0"
+ok "Root heal: $([ "$ROOT_HEAL_ENABLE" = "1" ] && echo enabled || echo disabled)"
+
+read -rp "$(echo -e ${CYAN}TERMUX_API_KEEPALIVE_ENABLE${NC}) start Termux:API KeepAliveService (root) y/n [default: $([ "$TERMUX_API_KEEPALIVE_ENABLE_DEFAULT" = "1" ] && echo y || echo n)]: " KEEPALIVE_IN
+KEEPALIVE_IN="${KEEPALIVE_IN:-$([ "$TERMUX_API_KEEPALIVE_ENABLE_DEFAULT" = "1" ] && echo y || echo n)}"
+[[ "$KEEPALIVE_IN" =~ ^[Yy]$ ]] && TERMUX_API_KEEPALIVE_ENABLE="1" || TERMUX_API_KEEPALIVE_ENABLE="0"
+ok "Termux:API keepalive: $([ "$TERMUX_API_KEEPALIVE_ENABLE" = "1" ] && echo enabled || echo disabled)"
+
 CONFIG_FILE="$CONF_DIR/config.env"
 cat > "$CONFIG_FILE" <<EOF
 # fadzPay Config (auto-generated)
@@ -271,12 +341,28 @@ DEVICE_ID='${DEVICE_ID}'
 INTERVAL_SEC='${INTERVAL_SEC}'
 MIN_AMOUNT='${MIN_AMOUNT}'
 WATCHDOG_INTERVAL='${WATCHDOG_INTERVAL}'
+HEARTBEAT_STALE_SEC='${HEARTBEAT_STALE_SEC}'
 TMUX_SESSION='${TMUX_SESSION}'
+
+# Notification matching
+ALLOW_PACKAGES='${ALLOW_PACKAGES}'
+TITLE_REGEX='${TITLE_REGEX}'
+CONTENT_REGEX='${CONTENT_REGEX}'
+
+# termux-notification-list robustness
+NOTIF_CMD_TIMEOUT='${NOTIF_CMD_TIMEOUT}'
+NOTIF_RETRY_COUNT='${NOTIF_RETRY_COUNT}'
+NOTIF_RETRY_DELAY='${NOTIF_RETRY_DELAY}'
 
 # Queue features
 QUEUE_MAX_LINES='${QUEUE_MAX_LINES}'
 QUEUE_TTL_HOURS='${QUEUE_TTL_HOURS}'
 NETCHECK_ENABLE='${NETCHECK_ENABLE}'
+
+# Anti-boomerang (root)
+ROOT_HEAL_ENABLE='${ROOT_HEAL_ENABLE}'
+TERMUX_API_KEEPALIVE_ENABLE='${TERMUX_API_KEEPALIVE_ENABLE}'
+TERMUX_API_NL_COMPONENT='${TERMUX_API_NL_COMPONENT}'
 EOF
 chmod 600 "$CONFIG_FILE"
 ok "Saved config: $CONFIG_FILE (chmod 600)"
@@ -284,38 +370,118 @@ ok "Saved config: $CONFIG_FILE (chmod 600)"
 # ============================================================================
 # 6) Create Scripts
 # ============================================================================
-info "[6/8] Creating scripts..."
+info "[6/9] Creating scripts..."
 
 # scan_notifs.sh
 cat > "$BIN_DIR/scan_notifs.sh" <<'SCAN_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "❌ missing: $1"; exit 1; }; }
 need termux-notification-list
 need jq
+
+BASE_DIR="$HOME/fadzpay"
+CONF="$BASE_DIR/config/config.env"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && source "$CONF" || true
+
+ALLOW_PACKAGES="${ALLOW_PACKAGES:-com.gojek.gopaymerchant}"
 
 echo "════════════════════════════════════════════════════════════"
 echo "  fadzPay Notification Scanner"
 echo "════════════════════════════════════════════════════════════"
 echo
+echo "Allow packages: $ALLOW_PACKAGES"
+echo
 
-echo "📱 All Notifications:"
+echo "📱 All Notifications (package │ title │ content):"
 echo "────────────────────────────────────────────────────────────"
 termux-notification-list | jq -r '.[] | "\(.packageName)\t│\t\(.title)\t│\t\(.content)"' 2>/dev/null || echo "No notifications"
 
 echo
 echo "────────────────────────────────────────────────────────────"
-echo "💰 GoPay Merchant Notifications:"
+echo "🎯 Filtered (ALLOW_PACKAGES):"
 echo "────────────────────────────────────────────────────────────"
-termux-notification-list | jq -r '.[] | select(.packageName=="com.gojek.gopaymerchant") | "Title: \(.title)\nContent: \(.content)\nWhen: \(.when)\nKey: \(.key // .id)\n"' 2>/dev/null || echo "No GoPay Merchant notifications"
+IFS=',' read -r -a P <<<"$ALLOW_PACKAGES"
+termux-notification-list | jq -r '.[] | "\(.packageName)\t│\t\(.title)\t│\t\(.content)\t│\twhen=\(.when)\t│\tkey=\(.key // .id)"' 2>/dev/null | while IFS= read -r line; do
+  pkg="$(printf '%s' "$line" | cut -f1)"
+  for x in "${P[@]}"; do
+    x="${x//[[:space:]]/}"
+    [ -n "$x" ] && [ "$pkg" = "$x" ] && echo "$line"
+  done
+done
 SCAN_EOF
 chmod +x "$BIN_DIR/scan_notifs.sh"
 ok "Created: scan_notifs.sh"
 
-# forwarder.sh (queue + retry + ttl + net-check + queue dedupe + device_id)
+# doctor.sh (quick diagnostics)
+cat > "$BIN_DIR/doctor.sh" <<'DOC_EOF'
+#!/data/data/com.termux/files/usr/bin/bash
+set -Eeuo pipefail
+
+BASE_DIR="$HOME/fadzpay"
+CONF="$BASE_DIR/config/config.env"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && source "$CONF" || true
+
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+ok(){ echo -e "${GREEN}✓${NC} $1"; }
+warn(){ echo -e "${YELLOW}⚠${NC} $1"; }
+info(){ echo -e "${BLUE}ℹ${NC} $1"; }
+err(){ echo -e "${RED}✗${NC} $1"; }
+
+need(){ command -v "$1" >/dev/null 2>&1 || { err "Missing: $1"; exit 1; }; }
+
+need termux-notification-list
+need jq
+
+echo "════════════════════════════════════════════════════════════"
+echo "  fadzPay Doctor"
+echo "════════════════════════════════════════════════════════════"
+
+info "Config: $CONF"
+info "Allow packages: ${ALLOW_PACKAGES:-com.gojek.gopaymerchant}"
+info "Regex title : ${TITLE_REGEX:-}"
+info "Regex cont  : ${CONTENT_REGEX:-}"
+echo
+
+info "Test termux-notification-list..."
+raw="$(timeout "${NOTIF_CMD_TIMEOUT:-4}" termux-notification-list 2>&1 || true)"
+if jq -e 'type=="array"' <<<"$raw" >/dev/null 2>&1; then
+  ok "termux-notification-list OK (JSON array). count=$(jq 'length' <<<"$raw" 2>/dev/null || echo '?')"
+elif jq -e 'type=="object" and has("error")' <<<"$raw" >/dev/null 2>&1; then
+  err "Termux:API returned error JSON: $(jq -r '.error' <<<"$raw")"
+else
+  warn "termux-notification-list output not JSON array. raw: ${raw:0:120}"
+fi
+echo
+
+if command -v su >/dev/null 2>&1; then
+  info "Root detected. Checking notification listener enabled..."
+  comp="${TERMUX_API_NL_COMPONENT:-com.termux.api/com.termux.api.apis.NotificationListAPI$NotificationService}"
+  cur="$(su -c "settings get secure enabled_notification_listeners" 2>/dev/null || true)"
+  if printf '%s' "$cur" | grep -qF "$comp"; then
+    ok "Notification listener is listed in enabled_notification_listeners"
+  else
+    warn "Listener NOT found in enabled_notification_listeners"
+    warn "Try: su -c \"cmd notification allow_listener $comp\""
+  fi
+
+  info "Trying to start Termux:API KeepAliveService (best effort)..."
+  su -c "am startservice -n com.termux.api/.KeepAliveService" >/dev/null 2>&1 && ok "KeepAliveService startservice issued" || warn "KeepAliveService startservice failed (ignored)"
+else
+  info "No root (su not found). Skipping root checks."
+fi
+echo
+ok "Doctor done."
+DOC_EOF
+chmod +x "$BIN_DIR/doctor.sh"
+ok "Created: doctor.sh"
+
+# forwarder.sh (optimized + auto-heal)
 cat > "$BIN_DIR/forwarder.sh" <<'FORWARDER_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
-set -euo pipefail
+set -uo pipefail
 umask 077
 
 BASE_DIR="__BASE_DIR__"
@@ -323,6 +489,7 @@ CONFIG_FILE="$BASE_DIR/config/config.env"
 
 LOG_FILE="$BASE_DIR/logs/fadzpay-forwarder.log"
 STATE_FILE="$BASE_DIR/state/seen_fingerprints.txt"
+HEARTBEAT_FILE="$BASE_DIR/state/heartbeat.ts"
 
 QUEUE_DIR="$BASE_DIR/queue"
 QUEUE_FILE="$QUEUE_DIR/pending.jsonl"
@@ -331,17 +498,13 @@ QUEUE_TMP="$QUEUE_DIR/pending.tmp"
 STATE_MAX_LINES=7000
 MAX_AMOUNT=100000000
 
-PKG_ALLOW="com.gojek.gopaymerchant"
-TITLE_REGEX='^Pembayaran diterima$'
-CONTENT_REGEX='Pembayaran[[:space:]]+QRIS[[:space:]]+Rp'
-
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "❌ Missing: $1"; exit 1; }; }
-need jq; need curl; need openssl; need awk; need grep; need sed; need sha256sum; need wc; need tail; need mv; need mkdir
+need jq; need curl; need openssl; need awk; need grep; need sed; need sha256sum; need wc; need tail; need mv; need mkdir; need timeout
 need termux-notification-list; need termux-notification
 
 mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")" "$QUEUE_DIR" "$BASE_DIR/state"
-touch "$LOG_FILE" "$STATE_FILE" "$QUEUE_FILE"
-chmod 600 "$STATE_FILE" "$QUEUE_FILE" 2>/dev/null || true
+touch "$LOG_FILE" "$STATE_FILE" "$QUEUE_FILE" "$HEARTBEAT_FILE"
+chmod 600 "$STATE_FILE" "$QUEUE_FILE" "$HEARTBEAT_FILE" 2>/dev/null || true
 
 if [ ! -f "$CONFIG_FILE" ]; then
   echo "❌ Config missing: $CONFIG_FILE" | tee -a "$LOG_FILE"
@@ -354,11 +517,24 @@ source "$CONFIG_FILE"
 API_BASE="${API_BASE%/}"
 WEBHOOK_URL="${API_BASE}/webhook/payment"
 
+# Defaults (safe)
 QUEUE_MAX_LINES="${QUEUE_MAX_LINES:-3000}"
 QUEUE_TTL_HOURS="${QUEUE_TTL_HOURS:-48}"
 NETCHECK_ENABLE="${NETCHECK_ENABLE:-1}"
 INTERVAL_SEC="${INTERVAL_SEC:-0.5}"
 MIN_AMOUNT="${MIN_AMOUNT:-1}"
+
+ALLOW_PACKAGES="${ALLOW_PACKAGES:-com.gojek.gopaymerchant}"
+TITLE_REGEX="${TITLE_REGEX:-Pembayaran[[:space:]]+diterima}"
+CONTENT_REGEX="${CONTENT_REGEX:-QRIS.*[Rr][Pp][[:space:]]*[0-9]}"
+
+NOTIF_CMD_TIMEOUT="${NOTIF_CMD_TIMEOUT:-4}"
+NOTIF_RETRY_COUNT="${NOTIF_RETRY_COUNT:-3}"
+NOTIF_RETRY_DELAY="${NOTIF_RETRY_DELAY:-0.2}"
+
+ROOT_HEAL_ENABLE="${ROOT_HEAL_ENABLE:-0}"
+TERMUX_API_KEEPALIVE_ENABLE="${TERMUX_API_KEEPALIVE_ENABLE:-0}"
+TERMUX_API_NL_COMPONENT="${TERMUX_API_NL_COMPONENT:-com.termux.api/com.termux.api.apis.NotificationListAPI\$NotificationService}"
 
 TTL_MS=$(( QUEUE_TTL_HOURS * 60 * 60 * 1000 ))
 
@@ -375,7 +551,6 @@ trim_file_by_lines(){
     tail -n "$keep" "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
   fi
 }
-
 trim_state(){ trim_file_by_lines "$STATE_FILE" "$STATE_MAX_LINES"; }
 trim_queue(){ trim_file_by_lines "$QUEUE_FILE" "$QUEUE_MAX_LINES"; }
 
@@ -394,7 +569,7 @@ now_ms(){
 
 gen_device_id(){
   if [ -r /proc/sys/kernel/random/uuid ]; then
-    cat /proc/sys/kernel/random/uuid | tr -d '\n'
+    tr -d '\n' < /proc/sys/kernel/random/uuid
     return 0
   fi
   local a
@@ -404,7 +579,7 @@ gen_device_id(){
 
 DEVICE_ID="${DEVICE_ID:-}"
 if [ -z "${DEVICE_ID}" ] && [ -s "$DEVICE_ID_STATE" ]; then
-  DEVICE_ID="$(cat "$DEVICE_ID_STATE" 2>/dev/null | head -n1 | tr -d '\r\n' || true)"
+  DEVICE_ID="$(head -n1 "$DEVICE_ID_STATE" 2>/dev/null | tr -d '\r\n' || true)"
 fi
 if [ -z "${DEVICE_ID}" ]; then
   DEVICE_ID="$(gen_device_id)"
@@ -424,8 +599,10 @@ post_json(){
   input="${ts}.${body}"
   sig="$(hmac_sig_hex "$input")"
 
+  # no response body to reduce cpu/io
   out="$(curl -sS --max-time 12 --connect-timeout 6 \
     --retry 1 --retry-delay 1 --retry-connrefused \
+    -o /dev/null -w "HTTP=%{http_code}" \
     -H "Content-Type: application/json" \
     -H "X-Forwarder-Token: ${TOKEN}" \
     -H "X-Forwarder-Pin: ${PIN}" \
@@ -433,8 +610,7 @@ post_json(){
     -H "X-TS: ${ts}" \
     -H "X-Signature: ${sig}" \
     -X POST "$WEBHOOK_URL" \
-    --data-raw "$body" \
-    -w " HTTP=%{http_code}" 2>&1 || true)"
+    --data-raw "$body" 2>&1 || true)"
 
   echo "$out"
 }
@@ -447,6 +623,54 @@ net_is_up(){
   [ "$code" != "000" ]
 }
 
+# ---- Root helpers (anti-boomerang) ----
+has_root(){
+  command -v su >/dev/null 2>&1
+}
+
+root_start_keepalive(){
+  [ "$TERMUX_API_KEEPALIVE_ENABLE" = "1" ] || return 0
+  has_root || return 0
+  su -c "am startservice -n com.termux.api/.KeepAliveService" >/dev/null 2>&1 || true
+}
+
+root_allow_notif_listener(){
+  [ "$ROOT_HEAL_ENABLE" = "1" ] || return 0
+  has_root || return 0
+
+  # Prefer cmd notification if available
+  if su -c "cmd notification allow_listener $TERMUX_API_NL_COMPONENT" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Fallback: secure settings (best effort)
+  local cur new
+  cur="$(su -c "settings get secure enabled_notification_listeners" 2>/dev/null || true)"
+  if printf '%s' "$cur" | grep -qF "$TERMUX_API_NL_COMPONENT"; then
+    return 0
+  fi
+  if [ -z "$cur" ] || [ "$cur" = "null" ]; then
+    new="$TERMUX_API_NL_COMPONENT"
+  else
+    new="${cur}:${TERMUX_API_NL_COMPONENT}"
+  fi
+  su -c "settings put secure enabled_notification_listeners '$new'" >/dev/null 2>&1 || true
+}
+
+root_heal_notif_backend(){
+  [ "$ROOT_HEAL_ENABLE" = "1" ] || return 0
+  has_root || return 0
+
+  root_start_keepalive
+  root_allow_notif_listener
+
+  # Force rebind (optional) - disallow then allow (best effort)
+  # NOTE: This can momentarily toggle access; use only when things are broken.
+  su -c "cmd notification disallow_listener $TERMUX_API_NL_COMPONENT" >/dev/null 2>&1 || true
+  su -c "cmd notification allow_listener $TERMUX_API_NL_COMPONENT" >/dev/null 2>&1 || true
+}
+
+# ---- Seen/QIDX ----
 declare -A SEEN
 while read -r fp; do
   [ -n "$fp" ] && SEEN["$fp"]=1 || true
@@ -569,6 +793,15 @@ queue_flush(){
   rebuild_qidx
 }
 
+# Allow packages set
+declare -A ALLOW_PKG
+IFS=',' read -r -a _pkgs <<<"$ALLOW_PACKAGES"
+for p in "${_pkgs[@]}"; do
+  p="${p//[[:space:]]/}"
+  [ -n "$p" ] && ALLOW_PKG["$p"]=1 || true
+done
+is_allowed_pkg(){ [[ -n "${ALLOW_PKG[$1]:-}" ]]; }
+
 termux-wake-lock 2>/dev/null || true
 
 cleanup(){
@@ -584,17 +817,25 @@ termux-notification \
   --ongoing --priority low --alert-once 2>/dev/null || true
 
 log "════════════════════════════════════════════════════════════"
-log "  fadzPay Forwarder (GoPay Merchant) + Queue/TTL/NetCheck"
+log "  fadzPay Forwarder (GoPay Merchant) + Queue + Auto-Heal"
 log "════════════════════════════════════════════════════════════"
 log "▶️  Started: $(date '+%Y-%m-%d %H:%M:%S')"
 log "🎯 Target : $WEBHOOK_URL"
 log "📱 Device : $DEVICE_ID"
 log "⏱️  Interval: ${INTERVAL_SEC}s"
 log "💰 Min Amount: Rp ${MIN_AMOUNT}"
+log "🧩 Allow packages: $ALLOW_PACKAGES"
+log "🔎 Regex title : $TITLE_REGEX"
+log "🔎 Regex cont  : $CONTENT_REGEX"
 log "📦 Queue file: $QUEUE_FILE (max_lines=$QUEUE_MAX_LINES, ttl_h=$QUEUE_TTL_HOURS)"
-log "🧠 Queue dedupe: enabled"
 log "🌐 Net-check: $([ "$NETCHECK_ENABLE" = "1" ] && echo enabled || echo disabled)"
+log "🛠 Root heal : $([ "$ROOT_HEAL_ENABLE" = "1" ] && echo enabled || echo disabled)"
+log "🧷 API keepalive: $([ "$TERMUX_API_KEEPALIVE_ENABLE" = "1" ] && echo enabled || echo disabled)"
 log "════════════════════════════════════════════════════════════"
+
+# Start keepalive once (best effort)
+root_start_keepalive || true
+root_allow_notif_listener || true
 
 PROCESSED_COUNT=0
 ERROR_COUNT=0
@@ -602,27 +843,95 @@ QUEUED_COUNT=0
 LAST_STATUS_PUSH=0
 STATUS_EVERY_MS=15000
 
+# Heartbeat
+LAST_HEARTBEAT_MS=0
+HEARTBEAT_EVERY_MS=5000
+
+# Notif list health
+NOTIF_FAIL_STREAK=0
+LAST_HEAL_TS=0
+HEAL_COOLDOWN_SEC=120
+HEAL_STREAK_THRESHOLD=5
+
+NOTIF_LAST_RAW=""
+
+notif_list_json(){
+  local i out
+  NOTIF_LAST_RAW=""
+  for ((i=1; i<=NOTIF_RETRY_COUNT; i++)); do
+    out="$(timeout "$NOTIF_CMD_TIMEOUT" termux-notification-list 2>&1 || true)"
+    NOTIF_LAST_RAW="$out"
+
+    # Normal path: array
+    if jq -e 'type=="array"' <<<"$out" >/dev/null 2>&1; then
+      echo "$out"
+      return 0
+    fi
+
+    # Error object from Termux:API
+    if jq -e 'type=="object" and has("error")' <<<"$out" >/dev/null 2>&1; then
+      log "⚠ [NOTIF] Termux:API error: $(jq -r '.error' <<<"$out" 2>/dev/null || echo "unknown")"
+      echo "[]"
+      return 0
+    fi
+
+    # Non-json or weird output
+    sleep "$NOTIF_RETRY_DELAY"
+  done
+  return 1
+}
+
+maybe_heal_notif(){
+  local now_s
+  now_s="$(date +%s)"
+  if [ "$ROOT_HEAL_ENABLE" != "1" ]; then
+    return 0
+  fi
+  if [ "$NOTIF_FAIL_STREAK" -lt "$HEAL_STREAK_THRESHOLD" ]; then
+    return 0
+  fi
+  if [ $((now_s - LAST_HEAL_TS)) -lt "$HEAL_COOLDOWN_SEC" ]; then
+    return 0
+  fi
+  LAST_HEAL_TS="$now_s"
+  log "🛠 [NOTIF] Healing backend (streak=$NOTIF_FAIL_STREAK)..."
+  root_heal_notif_backend || true
+  NOTIF_FAIL_STREAK=0
+}
+
 while :; do
+  # Heartbeat update
+  now="$(now_ms)"
+  if [ $((now - LAST_HEARTBEAT_MS)) -ge "$HEARTBEAT_EVERY_MS" ]; then
+    LAST_HEARTBEAT_MS="$now"
+    printf '%s' "$(date +%s)" > "$HEARTBEAT_FILE" 2>/dev/null || true
+  fi
+
   queue_flush || true
 
-  json="$(termux-notification-list 2>/dev/null || echo "[]")"
-  if [ -z "$json" ] || [ "$json" = "null" ]; then
+  if json="$(notif_list_json)"; then
+    NOTIF_FAIL_STREAK=0
+  else
+    NOTIF_FAIL_STREAK=$((NOTIF_FAIL_STREAK + 1))
+    log "⚠ [NOTIF] termux-notification-list failed (streak=$NOTIF_FAIL_STREAK). raw=${NOTIF_LAST_RAW:0:120}"
+    maybe_heal_notif || true
     sleep "$INTERVAL_SEC"
     continue
   fi
 
-  while read -r row; do
-    pkg="$(jq -r '.packageName // ""' <<<"$row")"
-    [ "$pkg" = "$PKG_ALLOW" ] || continue
+  # Parse notifications in single jq pass -> TSV
+  # fields: package, title, content, when, key
+  while IFS=$'\t' read -r pkg title content when key; do
+    [ -n "$pkg" ] || continue
+    is_allowed_pkg "$pkg" || continue
 
-    title="$(jq -r '.title // ""' <<<"$row")"
-    content="$(jq -r '.content // ""' <<<"$row")"
+    # match (tolerant)
+    printf '%s' "$title"   | grep -Eiq "$TITLE_REGEX"   || continue
+    printf '%s' "$content" | grep -Eiq "$CONTENT_REGEX" || continue
 
-    echo "$title"   | grep -Eq "$TITLE_REGEX"   || continue
-    echo "$content" | grep -Eq "$CONTENT_REGEX" || continue
-
-    when="$(jq -r '.when // ""' <<<"$row")"
-    key="$(jq -r '.key // (.id|tostring) // ""' <<<"$row")"
+    # when/key sanitizing
+    [ "$when" = "null" ] && when=""
+    [ "$key"  = "null" ] && key=""
 
     amt="$(extract_amount "$content")"
     [ -n "$amt" ] || continue
@@ -635,13 +944,9 @@ while :; do
     if [[ -n "${SEEN[$fingerprint]:-}" ]]; then
       continue
     fi
-
     if [[ -n "${QIDX[$fingerprint]:-}" ]]; then
       continue
     fi
-
-    # ✅ UPDATE: kirim event_ms numeric (ms epoch) biar Worker dedupe bucket stabil
-    event_ms="$(now_ms)"
 
     payload="$(jq -nc \
       --arg source "gopay_merchant" \
@@ -653,7 +958,6 @@ while :; do
       --arg fingerprint "$fingerprint" \
       --arg amount "$amt" \
       --arg device_id "$DEVICE_ID" \
-      --arg event_ms "$event_ms" \
       '{
         source: $source,
         package: $package,
@@ -663,16 +967,14 @@ while :; do
         key: $key,
         fingerprint: $fingerprint,
         amount: ($amount|tonumber),
-        device_id: $device_id,
-        event_ms: ($event_ms|tonumber),
-        ts_ms_epoch: ($event_ms|tonumber)
+        device_id: $device_id
       }'
     )"
 
     tslog="$(date '+%Y-%m-%d %H:%M:%S')"
     resp="$(post_json "$payload" || true)"
 
-    if [[ "$resp" =~ HTTP=2[0-9][0-9]$ ]]; then
+    if is_http_2xx "$resp"; then
       SEEN["$fingerprint"]=1
       echo "$fingerprint" >> "$STATE_FILE"
       trim_state
@@ -684,8 +986,13 @@ while :; do
       ERROR_COUNT=$((ERROR_COUNT + 1))
       QUEUED_COUNT=$((QUEUED_COUNT + 1))
     fi
-
-  done < <(jq -c '.[]' <<<"$json" 2>/dev/null || true)
+  done < <(jq -r '.[] | [
+      (.packageName // ""),
+      (.title // ""),
+      (.content // ""),
+      ((.when // "")|tostring),
+      ((.key // (.id|tostring) // "")|tostring)
+    ] | @tsv' <<<"$json" 2>/dev/null || true)
 
   now="$(now_ms)"
   if [ $((now - LAST_STATUS_PUSH)) -ge "$STATUS_EVERY_MS" ]; then
@@ -706,10 +1013,10 @@ sed -i "s|__BASE_DIR__|$BASE_DIR|g" "$BIN_DIR/forwarder.sh"
 chmod +x "$BIN_DIR/forwarder.sh"
 ok "Created: forwarder.sh"
 
-# forwarderctl.sh (tmux)
+# forwarderctl.sh
 cat > "$BIN_DIR/forwarderctl.sh" <<'CTL_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 
 BASE_DIR="__BASE_DIR__"
 SCRIPT="$BASE_DIR/bin/forwarder.sh"
@@ -777,17 +1084,87 @@ sed -i "s|__BASE_DIR__|$BASE_DIR|g" "$BIN_DIR/forwarderctl.sh"
 chmod +x "$BIN_DIR/forwarderctl.sh"
 ok "Created: forwarderctl.sh"
 
-# watchdog.sh
+# notif_keeper.sh (root keepalive + allow_listener periodic)
+cat > "$BIN_DIR/notif_keeper.sh" <<'NK_EOF'
+#!/data/data/com.termux/files/usr/bin/bash
+set -Eeuo pipefail
+umask 077
+
+BASE_DIR="__BASE_DIR__"
+CONF="$BASE_DIR/config/config.env"
+LOG="$BASE_DIR/logs/fadzpay-notif-keeper.log"
+PID_FILE="$BASE_DIR/state/notif_keeper.pid"
+
+mkdir -p "$BASE_DIR/logs" "$BASE_DIR/state"
+touch "$LOG"
+
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && source "$CONF" || true
+
+INTERVAL="${1:-60}"
+
+log(){ echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
+
+if [ -f "$PID_FILE" ]; then
+  oldpid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [ -n "${oldpid:-}" ] && kill -0 "$oldpid" 2>/dev/null; then
+    log "NOTIF_KEEPER already running (pid=$oldpid). Exit."
+    exit 0
+  fi
+fi
+echo $$ > "$PID_FILE"
+chmod 600 "$PID_FILE" 2>/dev/null || true
+
+cleanup(){ rm -f "$PID_FILE" 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
+
+ROOT_HEAL_ENABLE="${ROOT_HEAL_ENABLE:-0}"
+TERMUX_API_KEEPALIVE_ENABLE="${TERMUX_API_KEEPALIVE_ENABLE:-0}"
+TERMUX_API_NL_COMPONENT="${TERMUX_API_NL_COMPONENT:-com.termux.api/com.termux.api.apis.NotificationListAPI\$NotificationService}"
+
+if ! command -v su >/dev/null 2>&1; then
+  log "su not found -> notif_keeper disabled."
+  exit 0
+fi
+
+log "NOTIF_KEEPER start | interval=${INTERVAL}s | root_heal=$ROOT_HEAL_ENABLE | keepalive=$TERMUX_API_KEEPALIVE_ENABLE"
+
+while :; do
+  if [ "$TERMUX_API_KEEPALIVE_ENABLE" = "1" ]; then
+    su -c "am startservice -n com.termux.api/.KeepAliveService" >/dev/null 2>&1 || true
+  fi
+
+  if [ "$ROOT_HEAL_ENABLE" = "1" ]; then
+    su -c "cmd notification allow_listener $TERMUX_API_NL_COMPONENT" >/dev/null 2>&1 || true
+  fi
+
+  termux-notification \
+    --id walletnk \
+    --title "fadzPay NotifKeeper" \
+    --content "KeepAlive+Listener OK @ $(date '+%H:%M:%S')" \
+    --priority low --alert-once 2>/dev/null || true
+
+  sleep "$INTERVAL"
+done
+NK_EOF
+
+sed -i "s|__BASE_DIR__|$BASE_DIR|g" "$BIN_DIR/notif_keeper.sh"
+chmod +x "$BIN_DIR/notif_keeper.sh"
+ok "Created: notif_keeper.sh"
+
+# watchdog.sh (tmux + heartbeat check)
 cat > "$BIN_DIR/watchdog.sh" <<'WD_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 umask 077
 
 BASE_DIR="__BASE_DIR__"
 CONF="$BASE_DIR/config/config.env"
 CTL="$BASE_DIR/bin/forwarderctl.sh"
+NK="$BASE_DIR/bin/notif_keeper.sh"
 WD_LOG="$BASE_DIR/logs/fadzpay-watchdog.log"
 PID_FILE="$BASE_DIR/state/watchdog.pid"
+HEARTBEAT_FILE="$BASE_DIR/state/heartbeat.ts"
 
 INTERVAL="${1:-20}"
 
@@ -797,6 +1174,8 @@ touch "$WD_LOG"
 # shellcheck disable=SC1090
 [ -f "$CONF" ] && source "$CONF" || true
 [ -n "${WATCHDOG_INTERVAL:-}" ] && INTERVAL="${WATCHDOG_INTERVAL}"
+
+HEARTBEAT_STALE_SEC="${HEARTBEAT_STALE_SEC:-90}"
 
 log(){ echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$WD_LOG"; }
 
@@ -818,10 +1197,30 @@ trap cleanup EXIT INT TERM
 fail_burst=0
 MAX_FAIL_BURST=5
 
-log "WATCHDOG start | interval=${INTERVAL}s"
+log "WATCHDOG start | interval=${INTERVAL}s | heartbeat_stale=${HEARTBEAT_STALE_SEC}s"
+
+# Start notif_keeper too (best effort)
+nohup bash "$NK" 60 >/dev/null 2>&1 & disown || true
 
 while :; do
   if "$CTL" status >/dev/null 2>&1; then
+    # forwarder is up, now check heartbeat (detect hang)
+    if [ -f "$HEARTBEAT_FILE" ]; then
+      last="$(cat "$HEARTBEAT_FILE" 2>/dev/null || echo 0)"
+      now="$(date +%s)"
+      if [[ "$last" =~ ^[0-9]+$ ]] && [ "$last" -gt 0 ]; then
+        age=$((now - last))
+        if [ "$age" -gt "$HEARTBEAT_STALE_SEC" ]; then
+          log "Heartbeat stale (${age}s > ${HEARTBEAT_STALE_SEC}s). Restarting forwarder..."
+          "$CTL" restart >/dev/null 2>&1 || true
+          termux-notification \
+            --id walletwd \
+            --title "fadzPay Watchdog" \
+            --content "Heartbeat stale -> restarted @ $(date '+%H:%M:%S')" \
+            --priority low --alert-once 2>/dev/null || true
+        fi
+      fi
+    fi
     fail_burst=0
   else
     fail_burst=$((fail_burst + 1))
@@ -851,17 +1250,34 @@ ok "Created: watchdog.sh"
 # Boot script
 cat > "$BIN_DIR/start-fadzpay.sh" <<'BOOT_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 
 BASE_DIR="$HOME/fadzpay"
+CONF="$BASE_DIR/config/config.env"
 CTL="$BASE_DIR/bin/forwarderctl.sh"
 WD="$BASE_DIR/bin/watchdog.sh"
+NK="$BASE_DIR/bin/notif_keeper.sh"
 
 sleep 8
 termux-wake-lock 2>/dev/null || true
 
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && source "$CONF" || true
+
+# Optional root keepalive at boot (best effort)
+if command -v su >/dev/null 2>&1; then
+  if [ "${TERMUX_API_KEEPALIVE_ENABLE:-0}" = "1" ]; then
+    su -c "am startservice -n com.termux.api/.KeepAliveService" >/dev/null 2>&1 || true
+  fi
+  if [ "${ROOT_HEAL_ENABLE:-0}" = "1" ]; then
+    comp="${TERMUX_API_NL_COMPONENT:-com.termux.api/com.termux.api.apis.NotificationListAPI\$NotificationService}"
+    su -c "cmd notification allow_listener $comp" >/dev/null 2>&1 || true
+  fi
+fi
+
 "$CTL" start >/dev/null 2>&1 || true
 nohup bash "$WD" >/dev/null 2>&1 & disown || true
+nohup bash "$NK" 60 >/dev/null 2>&1 & disown || true
 BOOT_EOF
 
 chmod +x "$BIN_DIR/start-fadzpay.sh"
@@ -871,9 +1287,9 @@ chmod +x "$BOOT_FILE"
 ok "Created boot script: $BOOT_FILE"
 
 # ============================================================================
-# 7) Optional: Root anti-doze (for dedicated device)
+# 7) Optional: Root anti-doze (dedicated device)
 # ============================================================================
-info "[7/8] Optional root optimization (anti-doze)..."
+info "[7/9] Optional root optimization (anti-doze)..."
 if command -v su >/dev/null 2>&1; then
   rr="n"
   if [ "$AUTO_YES" = "1" ]; then rr="y"; fi
@@ -881,10 +1297,10 @@ if command -v su >/dev/null 2>&1; then
   if [ "$AUTO_YES" != "1" ]; then
     echo -e "${YELLOW}Kamu root. Apply anti-doze biar notif gak ketahan?${NC}"
     echo "Will run (best effort):"
-    echo "  dumpsys deviceidle whitelist +com.termux +com.termux.api +com.termux.boot +com.gojek.gopaymerchant"
-    echo "  cmd appops set <pkg> RUN_ANY_IN_BACKGROUND allow"
-    echo "  cmd appops set <pkg> WAKE_LOCK allow"
-    echo "Optional: disable doze total"
+    echo "  deviceidle whitelist + com.termux/com.termux.api/com.termux.boot/com.gojek.gopaymerchant"
+    echo "  appops allow background + wakelock"
+    echo "  set-standby-bucket active (kalau supported)"
+    echo "  enable notification listener via cmd notification allow_listener (Termux:API)"
     read -rp "Apply sekarang? (y/n): " -n 1 rr; echo
   else
     info "AUTO_YES=1 -> applying root anti-doze automatically"
@@ -895,12 +1311,20 @@ if command -v su >/dev/null 2>&1; then
       su -c "dumpsys deviceidle whitelist +$pkg" >/dev/null 2>&1 || true
       su -c "cmd appops set $pkg RUN_ANY_IN_BACKGROUND allow" >/dev/null 2>&1 || true
       su -c "cmd appops set $pkg WAKE_LOCK allow" >/dev/null 2>&1 || true
+      su -c "cmd appops set $pkg RUN_IN_BACKGROUND allow" >/dev/null 2>&1 || true
+      su -c "am set-standby-bucket $pkg active" >/dev/null 2>&1 || true
     done
 
+    # Termux:API KeepAliveService start
+    su -c "am startservice -n com.termux.api/.KeepAliveService" >/dev/null 2>&1 || true
+
+    # Ensure notification listener enabled (best effort)
+    su -c "cmd notification allow_listener $TERMUX_API_NL_COMPONENT" >/dev/null 2>&1 || true
+
     rr2="n"
-    if [ "$AUTO_YES" = "1" ]; then rr2="y"; fi
+    if [ "$AUTO_YES" = "1" ]; then rr2="n"; fi
     if [ "$AUTO_YES" != "1" ]; then
-      read -rp "Disable DOZE total? (y/n): " -n 1 rr2; echo
+      read -rp "Disable DOZE total? (y/n) [disarankan n untuk device harian]: " -n 1 rr2; echo
     fi
     if [[ "${rr2:-n}" =~ ^[Yy]$ ]]; then
       su -c "dumpsys deviceidle disable" >/dev/null 2>&1 || true
@@ -917,12 +1341,18 @@ else
 fi
 
 # ============================================================================
-# 8) Start services (tmux + watchdog)
+# 8) Start services (tmux + watchdog + notif_keeper)
 # ============================================================================
-info "[8/8] Starting services..."
+info "[8/9] Starting services..."
 "$BIN_DIR/forwarderctl.sh" start || true
 nohup bash "$BIN_DIR/watchdog.sh" >/dev/null 2>&1 & disown || true
-ok "Started fadzPay + watchdog"
+nohup bash "$BIN_DIR/notif_keeper.sh" 60 >/dev/null 2>&1 & disown || true
+ok "Started fadzPay + watchdog + notif_keeper"
+
+# ============================================================================
+# 9) Done
+# ============================================================================
+info "[9/9] Done"
 
 echo
 echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
@@ -933,15 +1363,18 @@ echo -e "${CYAN}📁 Directory:${NC} $BASE_DIR"
 echo -e "${CYAN}⚙️ Config:${NC} $CONFIG_FILE (chmod 600)"
 echo
 echo -e "${CYAN}🔧 Commands:${NC}"
-echo "  Status : $BIN_DIR/forwarderctl.sh status"
-echo "  Attach : $BIN_DIR/forwarderctl.sh attach"
-echo "  Restart: $BIN_DIR/forwarderctl.sh restart"
-echo "  Stop   : $BIN_DIR/forwarderctl.sh stop"
-echo "  Logs   : tail -f $BASE_DIR/logs/fadzpay-forwarder.log"
-echo "  Watchdog: tail -f $BASE_DIR/logs/fadzpay-watchdog.log"
-echo "  Queue  : wc -l $BASE_DIR/queue/pending.jsonl"
+echo "  Status  : $BIN_DIR/forwarderctl.sh status"
+echo "  Attach  : $BIN_DIR/forwarderctl.sh attach"
+echo "  Restart : $BIN_DIR/forwarderctl.sh restart"
+echo "  Stop    : $BIN_DIR/forwarderctl.sh stop"
+echo "  Logs    : tail -f $BASE_DIR/logs/fadzpay-forwarder.log"
+echo "  WD Logs : tail -f $BASE_DIR/logs/fadzpay-watchdog.log"
+echo "  NK Logs : tail -f $BASE_DIR/logs/fadzpay-notif-keeper.log"
+echo "  Queue   : wc -l $BASE_DIR/queue/pending.jsonl"
+echo "  Doctor  : $BIN_DIR/doctor.sh"
 echo
 echo -e "${CYAN}🚀 Auto-start:${NC} $BOOT_FILE"
 echo
 echo -e "${RED}🔐 SECURITY:${NC} Jangan share SECRET/PIN/TOKEN."
 ok "fadzPay ready ✅"
+EOF
