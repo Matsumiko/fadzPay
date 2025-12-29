@@ -4,18 +4,18 @@ umask 077
 
 # =================================================
 # fadzPay (Termux) - GoPay Merchant Notification Forwarder
-# Optimized + Samsung/OEM anti-boomerang edition
+# Optimized + Samsung/OEM anti-boomerang edition (FIXED)
 #
-# Key upgrades:
-# - termux-notification-list: timeout + retry + auto-heal (root) if service goes null
-# - Root helper: start Termux:API KeepAliveService + allow_listener NotificationListener
-# - Watchdog: heartbeat stale detection (detect hang, not only tmux session)
-# - Parsing: single jq pass per poll (lower CPU)
-# - Safer: handles JSON error objects from Termux:API
+# Fixes:
+# - No stray "EOF" line at end (no more: EOF: command not found)
+# - Root listener component quoting fixed (prevents $NotificationService expansion)
 #
-# NOTE:
-# - Root features are optional (best effort). If no root, it still runs.
-# - Keep secrets safe. Don't share TOKEN/SECRET/PIN.
+# Features:
+# - Smart reinstall, TMUX, Watchdog, Heartbeat hang detection
+# - Queue + retry + backoff + ttl + net-check + dedupe
+# - Robust termux-notification-list: timeout + retry + auto-heal (root)
+# - Root helper: Termux:API KeepAliveService + allow_listener NotificationListener
+# - Boot via Termux:Boot
 # =================================================
 
 RED='\033[0;31m'
@@ -25,29 +25,24 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-INSTALLER_VERSION="2025.12.29"
+INSTALLER_VERSION="2025.12.29-fix1"
 
 print_header() {
   echo -e "${CYAN}"
   echo "╔══════════════════════════════════════════════════════╗"
   echo "║                 fadzPay Installer                    ║"
   echo "║     GoPay Merchant Forwarder (TMUX + Queue + Heal)   ║"
-  echo "║                 v${INSTALLER_VERSION}                         ║"
+  echo "║               v${INSTALLER_VERSION}                      ║"
   echo "╚══════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 }
-
 ok(){ echo -e "${GREEN}✓${NC} $1"; }
 warn(){ echo -e "${YELLOW}⚠${NC} $1"; }
 info(){ echo -e "${BLUE}ℹ${NC} $1"; }
 err(){ echo -e "${RED}✗${NC} $1"; }
-
 need_cmd(){ command -v "$1" >/dev/null 2>&1; }
 
-die(){
-  err "$1"
-  exit 1
-}
+die(){ err "$1"; exit 1; }
 
 print_header
 
@@ -67,9 +62,8 @@ BOOT_FILE="${HOME}/.termux/boot/fadzpay.sh"
 
 AUTO_YES="${AUTO_YES:-0}"   # AUTO_YES=1 ./install_fadzpay.sh
 
-# Termux:API NotificationListener component (from Termux:API manifest)
-# service android:name=".apis.NotificationListAPI$NotificationService"
-TERMUX_API_NL_COMPONENT='com.termux.api/com.termux.api.apis.NotificationListAPI$NotificationService'
+# IMPORTANT: keep \$ in the component so it survives through root shell parsing
+TERMUX_API_NL_COMPONENT='com.termux.api/com.termux.api.apis.NotificationListAPI\$NotificationService'
 
 stop_everything_best_effort() {
   info "Stopping existing services (best effort)..."
@@ -271,7 +265,6 @@ NETCHECK_ENABLE="${NETCHECK_ENABLE:-y}"
 [[ "$NETCHECK_ENABLE" =~ ^[Yy]$ ]] && NETCHECK_ENABLE="1" || NETCHECK_ENABLE="0"
 ok "Net-check: $([ "$NETCHECK_ENABLE" = "1" ] && echo enabled || echo disabled)"
 
-# Default regex lebih toleran (banyak OEM/app notif beda2 spasi/tanda baca)
 DEFAULT_TITLE_REGEX='Pembayaran[[:space:]]+diterima'
 DEFAULT_CONTENT_REGEX='QRIS.*[Rr][Pp][[:space:]]*[0-9]'
 read -rp "$(echo -e ${CYAN}TITLE_REGEX${NC}) (grep -E) [default: $DEFAULT_TITLE_REGEX]: " TITLE_REGEX
@@ -287,7 +280,6 @@ read -rp "$(echo -e ${CYAN}ALLOW_PACKAGES${NC}) (comma-separated) [default: $DEF
 ALLOW_PACKAGES="${ALLOW_PACKAGES:-$DEFAULT_ALLOW_PACKAGES}"
 ok "Allow packages: $ALLOW_PACKAGES"
 
-# Notif fetch robust knobs
 read -rp "$(echo -e ${CYAN}NOTIF_CMD_TIMEOUT${NC}) timeout termux-notification-list (detik) [default: 4]: " NOTIF_CMD_TIMEOUT
 NOTIF_CMD_TIMEOUT="${NOTIF_CMD_TIMEOUT:-4}"
 if ! [[ "$NOTIF_CMD_TIMEOUT" =~ ^[0-9]+$ ]] || [ "$NOTIF_CMD_TIMEOUT" -lt 2 ]; then
@@ -312,7 +304,6 @@ if ! [[ "$NOTIF_RETRY_DELAY" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
 fi
 ok "Notif retry delay: ${NOTIF_RETRY_DELAY}s"
 
-# Root heal options (anti boomerang)
 ROOT_HEAL_ENABLE_DEFAULT="1"
 TERMUX_API_KEEPALIVE_ENABLE_DEFAULT="1"
 if ! command -v su >/dev/null 2>&1; then
@@ -372,7 +363,6 @@ ok "Saved config: $CONFIG_FILE (chmod 600)"
 # ============================================================================
 info "[6/9] Creating scripts..."
 
-# scan_notifs.sh
 cat > "$BIN_DIR/scan_notifs.sh" <<'SCAN_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 set -Eeuo pipefail
@@ -414,7 +404,6 @@ SCAN_EOF
 chmod +x "$BIN_DIR/scan_notifs.sh"
 ok "Created: scan_notifs.sh"
 
-# doctor.sh (quick diagnostics)
 cat > "$BIN_DIR/doctor.sh" <<'DOC_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 set -Eeuo pipefail
@@ -434,6 +423,7 @@ need(){ command -v "$1" >/dev/null 2>&1 || { err "Missing: $1"; exit 1; }; }
 
 need termux-notification-list
 need jq
+need timeout
 
 echo "════════════════════════════════════════════════════════════"
 echo "  fadzPay Doctor"
@@ -458,16 +448,16 @@ echo
 
 if command -v su >/dev/null 2>&1; then
   info "Root detected. Checking notification listener enabled..."
-  comp="${TERMUX_API_NL_COMPONENT:-com.termux.api/com.termux.api.apis.NotificationListAPI$NotificationService}"
+  comp="${TERMUX_API_NL_COMPONENT:-com.termux.api/com.termux.api.apis.NotificationListAPI\$NotificationService}"
   cur="$(su -c "settings get secure enabled_notification_listeners" 2>/dev/null || true)"
   if printf '%s' "$cur" | grep -qF "$comp"; then
     ok "Notification listener is listed in enabled_notification_listeners"
   else
     warn "Listener NOT found in enabled_notification_listeners"
-    warn "Try: su -c \"cmd notification allow_listener $comp\""
+    warn "Try: su -c \"cmd notification allow_listener '$comp'\""
   fi
 
-  info "Trying to start Termux:API KeepAliveService (best effort)..."
+  info "Starting Termux:API KeepAliveService (best effort)..."
   su -c "am startservice -n com.termux.api/.KeepAliveService" >/dev/null 2>&1 && ok "KeepAliveService startservice issued" || warn "KeepAliveService startservice failed (ignored)"
 else
   info "No root (su not found). Skipping root checks."
@@ -478,7 +468,6 @@ DOC_EOF
 chmod +x "$BIN_DIR/doctor.sh"
 ok "Created: doctor.sh"
 
-# forwarder.sh (optimized + auto-heal)
 cat > "$BIN_DIR/forwarder.sh" <<'FORWARDER_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 set -uo pipefail
@@ -517,7 +506,6 @@ source "$CONFIG_FILE"
 API_BASE="${API_BASE%/}"
 WEBHOOK_URL="${API_BASE}/webhook/payment"
 
-# Defaults (safe)
 QUEUE_MAX_LINES="${QUEUE_MAX_LINES:-3000}"
 QUEUE_TTL_HOURS="${QUEUE_TTL_HOURS:-48}"
 NETCHECK_ENABLE="${NETCHECK_ENABLE:-1}"
@@ -599,7 +587,6 @@ post_json(){
   input="${ts}.${body}"
   sig="$(hmac_sig_hex "$input")"
 
-  # no response body to reduce cpu/io
   out="$(curl -sS --max-time 12 --connect-timeout 6 \
     --retry 1 --retry-delay 1 --retry-connrefused \
     -o /dev/null -w "HTTP=%{http_code}" \
@@ -623,10 +610,7 @@ net_is_up(){
   [ "$code" != "000" ]
 }
 
-# ---- Root helpers (anti-boomerang) ----
-has_root(){
-  command -v su >/dev/null 2>&1
-}
+has_root(){ command -v su >/dev/null 2>&1; }
 
 root_start_keepalive(){
   [ "$TERMUX_API_KEEPALIVE_ENABLE" = "1" ] || return 0
@@ -638,12 +622,10 @@ root_allow_notif_listener(){
   [ "$ROOT_HEAL_ENABLE" = "1" ] || return 0
   has_root || return 0
 
-  # Prefer cmd notification if available
-  if su -c "cmd notification allow_listener $TERMUX_API_NL_COMPONENT" >/dev/null 2>&1; then
-    return 0
-  fi
+  # ✅ IMPORTANT: quote the component in root shell to prevent $ expansion
+  su -c "cmd notification allow_listener '$TERMUX_API_NL_COMPONENT'" >/dev/null 2>&1 && return 0
 
-  # Fallback: secure settings (best effort)
+  # fallback: secure settings (best effort)
   local cur new
   cur="$(su -c "settings get secure enabled_notification_listeners" 2>/dev/null || true)"
   if printf '%s' "$cur" | grep -qF "$TERMUX_API_NL_COMPONENT"; then
@@ -664,13 +646,11 @@ root_heal_notif_backend(){
   root_start_keepalive
   root_allow_notif_listener
 
-  # Force rebind (optional) - disallow then allow (best effort)
-  # NOTE: This can momentarily toggle access; use only when things are broken.
-  su -c "cmd notification disallow_listener $TERMUX_API_NL_COMPONENT" >/dev/null 2>&1 || true
-  su -c "cmd notification allow_listener $TERMUX_API_NL_COMPONENT" >/dev/null 2>&1 || true
+  # optional force rebind (quoted)
+  su -c "cmd notification disallow_listener '$TERMUX_API_NL_COMPONENT'" >/dev/null 2>&1 || true
+  su -c "cmd notification allow_listener '$TERMUX_API_NL_COMPONENT'" >/dev/null 2>&1 || true
 }
 
-# ---- Seen/QIDX ----
 declare -A SEEN
 while read -r fp; do
   [ -n "$fp" ] && SEEN["$fp"]=1 || true
@@ -793,7 +773,6 @@ queue_flush(){
   rebuild_qidx
 }
 
-# Allow packages set
 declare -A ALLOW_PKG
 IFS=',' read -r -a _pkgs <<<"$ALLOW_PACKAGES"
 for p in "${_pkgs[@]}"; do
@@ -833,21 +812,17 @@ log "🛠 Root heal : $([ "$ROOT_HEAL_ENABLE" = "1" ] && echo enabled || echo di
 log "🧷 API keepalive: $([ "$TERMUX_API_KEEPALIVE_ENABLE" = "1" ] && echo enabled || echo disabled)"
 log "════════════════════════════════════════════════════════════"
 
-# Start keepalive once (best effort)
 root_start_keepalive || true
 root_allow_notif_listener || true
 
 PROCESSED_COUNT=0
 ERROR_COUNT=0
-QUEUED_COUNT=0
 LAST_STATUS_PUSH=0
 STATUS_EVERY_MS=15000
 
-# Heartbeat
 LAST_HEARTBEAT_MS=0
 HEARTBEAT_EVERY_MS=5000
 
-# Notif list health
 NOTIF_FAIL_STREAK=0
 LAST_HEAL_TS=0
 HEAL_COOLDOWN_SEC=120
@@ -862,20 +837,16 @@ notif_list_json(){
     out="$(timeout "$NOTIF_CMD_TIMEOUT" termux-notification-list 2>&1 || true)"
     NOTIF_LAST_RAW="$out"
 
-    # Normal path: array
     if jq -e 'type=="array"' <<<"$out" >/dev/null 2>&1; then
       echo "$out"
       return 0
     fi
-
-    # Error object from Termux:API
     if jq -e 'type=="object" and has("error")' <<<"$out" >/dev/null 2>&1; then
       log "⚠ [NOTIF] Termux:API error: $(jq -r '.error' <<<"$out" 2>/dev/null || echo "unknown")"
       echo "[]"
       return 0
     fi
 
-    # Non-json or weird output
     sleep "$NOTIF_RETRY_DELAY"
   done
   return 1
@@ -884,15 +855,10 @@ notif_list_json(){
 maybe_heal_notif(){
   local now_s
   now_s="$(date +%s)"
-  if [ "$ROOT_HEAL_ENABLE" != "1" ]; then
-    return 0
-  fi
-  if [ "$NOTIF_FAIL_STREAK" -lt "$HEAL_STREAK_THRESHOLD" ]; then
-    return 0
-  fi
-  if [ $((now_s - LAST_HEAL_TS)) -lt "$HEAL_COOLDOWN_SEC" ]; then
-    return 0
-  fi
+  [ "$ROOT_HEAL_ENABLE" = "1" ] || return 0
+  [ "$NOTIF_FAIL_STREAK" -ge "$HEAL_STREAK_THRESHOLD" ] || return 0
+  [ $((now_s - LAST_HEAL_TS)) -ge "$HEAL_COOLDOWN_SEC" ] || return 0
+
   LAST_HEAL_TS="$now_s"
   log "🛠 [NOTIF] Healing backend (streak=$NOTIF_FAIL_STREAK)..."
   root_heal_notif_backend || true
@@ -900,7 +866,6 @@ maybe_heal_notif(){
 }
 
 while :; do
-  # Heartbeat update
   now="$(now_ms)"
   if [ $((now - LAST_HEARTBEAT_MS)) -ge "$HEARTBEAT_EVERY_MS" ]; then
     LAST_HEARTBEAT_MS="$now"
@@ -919,17 +884,13 @@ while :; do
     continue
   fi
 
-  # Parse notifications in single jq pass -> TSV
-  # fields: package, title, content, when, key
   while IFS=$'\t' read -r pkg title content when key; do
     [ -n "$pkg" ] || continue
     is_allowed_pkg "$pkg" || continue
 
-    # match (tolerant)
     printf '%s' "$title"   | grep -Eiq "$TITLE_REGEX"   || continue
     printf '%s' "$content" | grep -Eiq "$CONTENT_REGEX" || continue
 
-    # when/key sanitizing
     [ "$when" = "null" ] && when=""
     [ "$key"  = "null" ] && key=""
 
@@ -984,7 +945,6 @@ while :; do
       queue_push "$fingerprint" "$payload"
       log "✗ $tslog | Rp ${amt} | QUEUED | ${resp:0:120} | ${content:0:70}..."
       ERROR_COUNT=$((ERROR_COUNT + 1))
-      QUEUED_COUNT=$((QUEUED_COUNT + 1))
     fi
   done < <(jq -r '.[] | [
       (.packageName // ""),
@@ -1013,7 +973,6 @@ sed -i "s|__BASE_DIR__|$BASE_DIR|g" "$BIN_DIR/forwarder.sh"
 chmod +x "$BIN_DIR/forwarder.sh"
 ok "Created: forwarder.sh"
 
-# forwarderctl.sh
 cat > "$BIN_DIR/forwarderctl.sh" <<'CTL_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 set -Eeuo pipefail
@@ -1084,7 +1043,6 @@ sed -i "s|__BASE_DIR__|$BASE_DIR|g" "$BIN_DIR/forwarderctl.sh"
 chmod +x "$BIN_DIR/forwarderctl.sh"
 ok "Created: forwarderctl.sh"
 
-# notif_keeper.sh (root keepalive + allow_listener periodic)
 cat > "$BIN_DIR/notif_keeper.sh" <<'NK_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 set -Eeuo pipefail
@@ -1135,7 +1093,8 @@ while :; do
   fi
 
   if [ "$ROOT_HEAL_ENABLE" = "1" ]; then
-    su -c "cmd notification allow_listener $TERMUX_API_NL_COMPONENT" >/dev/null 2>&1 || true
+    # ✅ quote component to avoid $ expansion
+    su -c "cmd notification allow_listener '$TERMUX_API_NL_COMPONENT'" >/dev/null 2>&1 || true
   fi
 
   termux-notification \
@@ -1152,7 +1111,6 @@ sed -i "s|__BASE_DIR__|$BASE_DIR|g" "$BIN_DIR/notif_keeper.sh"
 chmod +x "$BIN_DIR/notif_keeper.sh"
 ok "Created: notif_keeper.sh"
 
-# watchdog.sh (tmux + heartbeat check)
 cat > "$BIN_DIR/watchdog.sh" <<'WD_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 set -Eeuo pipefail
@@ -1199,12 +1157,10 @@ MAX_FAIL_BURST=5
 
 log "WATCHDOG start | interval=${INTERVAL}s | heartbeat_stale=${HEARTBEAT_STALE_SEC}s"
 
-# Start notif_keeper too (best effort)
 nohup bash "$NK" 60 >/dev/null 2>&1 & disown || true
 
 while :; do
   if "$CTL" status >/dev/null 2>&1; then
-    # forwarder is up, now check heartbeat (detect hang)
     if [ -f "$HEARTBEAT_FILE" ]; then
       last="$(cat "$HEARTBEAT_FILE" 2>/dev/null || echo 0)"
       now="$(date +%s)"
@@ -1247,7 +1203,6 @@ sed -i "s|__BASE_DIR__|$BASE_DIR|g" "$BIN_DIR/watchdog.sh"
 chmod +x "$BIN_DIR/watchdog.sh"
 ok "Created: watchdog.sh"
 
-# Boot script
 cat > "$BIN_DIR/start-fadzpay.sh" <<'BOOT_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 set -Eeuo pipefail
@@ -1264,14 +1219,13 @@ termux-wake-lock 2>/dev/null || true
 # shellcheck disable=SC1090
 [ -f "$CONF" ] && source "$CONF" || true
 
-# Optional root keepalive at boot (best effort)
 if command -v su >/dev/null 2>&1; then
   if [ "${TERMUX_API_KEEPALIVE_ENABLE:-0}" = "1" ]; then
     su -c "am startservice -n com.termux.api/.KeepAliveService" >/dev/null 2>&1 || true
   fi
   if [ "${ROOT_HEAL_ENABLE:-0}" = "1" ]; then
     comp="${TERMUX_API_NL_COMPONENT:-com.termux.api/com.termux.api.apis.NotificationListAPI\$NotificationService}"
-    su -c "cmd notification allow_listener $comp" >/dev/null 2>&1 || true
+    su -c "cmd notification allow_listener '$comp'" >/dev/null 2>&1 || true
   fi
 fi
 
@@ -1315,14 +1269,11 @@ if command -v su >/dev/null 2>&1; then
       su -c "am set-standby-bucket $pkg active" >/dev/null 2>&1 || true
     done
 
-    # Termux:API KeepAliveService start
     su -c "am startservice -n com.termux.api/.KeepAliveService" >/dev/null 2>&1 || true
-
-    # Ensure notification listener enabled (best effort)
-    su -c "cmd notification allow_listener $TERMUX_API_NL_COMPONENT" >/dev/null 2>&1 || true
+    # ✅ quote component
+    su -c "cmd notification allow_listener '$TERMUX_API_NL_COMPONENT'" >/dev/null 2>&1 || true
 
     rr2="n"
-    if [ "$AUTO_YES" = "1" ]; then rr2="n"; fi
     if [ "$AUTO_YES" != "1" ]; then
       read -rp "Disable DOZE total? (y/n) [disarankan n untuk device harian]: " -n 1 rr2; echo
     fi
@@ -1377,4 +1328,3 @@ echo -e "${CYAN}🚀 Auto-start:${NC} $BOOT_FILE"
 echo
 echo -e "${RED}🔐 SECURITY:${NC} Jangan share SECRET/PIN/TOKEN."
 ok "fadzPay ready ✅"
-EOF
