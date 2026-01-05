@@ -3,19 +3,17 @@ set -euo pipefail
 umask 077
 
 # =================================================
-# fadzPay (Termux) - ShopeePay/Shopee QRIS Merchant Notification Forwarder
-#
-# - Smart reinstall (marker-based)
+# fadzPay (Termux) - ShopeePay Notification Forwarder
 # - TMUX mode + WATCHDOG auto-restart
 # - wake-lock + optional root anti-doze
-# - boot via Termux:Boot
-# - QUEUE + RETRY + BACKOFF + TTL + NETCHECK
-# - QUEUE DEDUPE (anti duplicate when offline)
+# - boot via Termux:Boot (tmux + watchdog)
+# - QUEUE + RETRY + BACKOFF (anti miss when internet/server down)
+# - TTL queue (drop too-old pending items)
+# - NET-CHECK (skip flush when network really down)
+# - QUEUE DEDUPE (anti duplicate queue when offline)
 # - INTERVAL_SEC supports float (e.g. 0.5)
 # - DEVICE_ID (manual or auto UUID) -> sent to worker
-#
-# Worker endpoint expected:
-#   POST {API_BASE}/webhook/payment
+# - Extract AMOUNT from title + TXID from content (ShopeePay)
 # =================================================
 
 RED='\033[0;31m'
@@ -29,7 +27,7 @@ print_header() {
   echo -e "${CYAN}"
   echo "╔══════════════════════════════════════════════════════╗"
   echo "║                 fadzPay Installer                    ║"
-  echo "║     ShopeePay Notif Forwarder (TMUX + Queue)         ║"
+  echo "║     ShopeePay Forwarder (TMUX + Queue + TXID)        ║"
   echo "╚══════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 }
@@ -41,9 +39,9 @@ need_cmd(){ command -v "$1" >/dev/null 2>&1; }
 
 print_header
 
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Globals
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 BASE_DIR="${HOME}/fadzpay"
 BIN_DIR="$BASE_DIR/bin"
 LOG_DIR="$BASE_DIR/logs"
@@ -55,7 +53,7 @@ MARKER_FILE="$BASE_DIR/.fadzpay_installed_marker"
 TMUX_SESSION="fadzpay"
 BOOT_FILE="${HOME}/.termux/boot/fadzpay.sh"
 
-AUTO_YES="${AUTO_YES:-0}"   # AUTO_YES=1 ./install_fadzpay_shopee.sh
+AUTO_YES="${AUTO_YES:-0}"   # AUTO_YES=1 ./install_xxx.sh
 
 stop_everything_best_effort() {
   info "Stopping existing services (best effort)..."
@@ -110,9 +108,9 @@ gen_device_id() {
   echo "${a:0:8}-${a:8:4}-${a:12:4}-${a:16:4}-${a:20:12}"
 }
 
-# ==========================================================================
+# ============================================================================
 # 1) Update & Install Dependencies
-# ==========================================================================
+# ============================================================================
 info "[1/8] Updating packages..."
 pkg update -y >/dev/null 2>&1 && ok "Package index updated" || true
 pkg upgrade -y >/dev/null 2>&1 && ok "Packages upgraded" || true
@@ -135,24 +133,24 @@ if ! need_cmd termux-notification-list; then
   [[ "${c:-n}" =~ ^[Yy]$ ]] || exit 1
 fi
 
-# ==========================================================================
+# ============================================================================
 # 3) Smart Reinstall Detect
-# ==========================================================================
+# ============================================================================
 info "[3/8] Smart install detector..."
 backup_or_remove_old_install
 
-# ==========================================================================
+# ============================================================================
 # 4) Setup Directories
-# ==========================================================================
+# ============================================================================
 info "[4/8] Setting up directories..."
 mkdir -p "$BIN_DIR" "$LOG_DIR" "$STATE_DIR" "$CONF_DIR" "$QUEUE_DIR"
 touch "$MARKER_FILE"
 chmod 600 "$MARKER_FILE" 2>/dev/null || true
 ok "Prepared: $BASE_DIR"
 
-# ==========================================================================
+# ============================================================================
 # 5) Configuration Input
-# ==========================================================================
+# ============================================================================
 info "[5/8] Configuration setup..."
 echo
 
@@ -176,7 +174,7 @@ while true; do
 done
 
 while true; do
-  read -rsp "$(echo -e ${CYAN}TOKEN${NC}) (harus sama dengan TOKEN di worker): " TOKEN
+  read -rsp "$(echo -e ${CYAN}TOKEN${NC}) (harus sama dengan TOKEN di server kamu): " TOKEN
   echo
   if [ -z "${TOKEN:-}" ]; then err "TOKEN wajib diisi!"; else ok "Token configured (${#TOKEN} chars)"; break; fi
 done
@@ -198,16 +196,6 @@ DEFAULT_DEVICE_ID="$(gen_device_id)"
 read -rp "$(echo -e ${CYAN}DEVICE_ID${NC}) (opsional, contoh: S8-WIFI / S8-PLUS-DATA) [enter=auto]: " DEVICE_ID
 DEVICE_ID="${DEVICE_ID:-$DEFAULT_DEVICE_ID}"
 ok "Device ID: ${DEVICE_ID}"
-
-# ✅ Shopee packageName(s)
-# Kamu bisa isi 1 atau lebih, pisahkan koma.
-# Lihat packageName asli dengan:  $HOME/fadzpay/bin/scan_notifs.sh
-DEFAULT_NOTIF_PKGS="com.shopeepay.id"
-read -rp "$(echo -e ${CYAN}NOTIF_PKG_LIST${NC}) (packageName Shopee, bisa multi pakai koma) [default: $DEFAULT_NOTIF_PKGS]: " NOTIF_PKG_LIST
-NOTIF_PKG_LIST="${NOTIF_PKG_LIST:-$DEFAULT_NOTIF_PKGS}"
-# normalize spaces
-NOTIF_PKG_LIST="$(echo "$NOTIF_PKG_LIST" | tr -d ' ' )"
-ok "Notif packages: ${NOTIF_PKG_LIST}"
 
 # ✅ float interval support
 read -rp "$(echo -e ${CYAN}INTERVAL_SEC${NC}) (boleh float, contoh 0.5) [default: 0.5]: " INTERVAL_SEC
@@ -259,6 +247,12 @@ NETCHECK_ENABLE="${NETCHECK_ENABLE:-y}"
 [[ "$NETCHECK_ENABLE" =~ ^[Yy]$ ]] && NETCHECK_ENABLE="1" || NETCHECK_ENABLE="0"
 ok "Net-check: $([ "$NETCHECK_ENABLE" = "1" ] && echo enabled || echo disabled)"
 
+# ✅ ShopeePay package list
+DEFAULT_PKG_LIST="com.shopeepay.id,com.shopee.id"
+read -rp "$(echo -e ${CYAN}NOTIF_PKG_LIST${NC}) (koma-separated) [default: $DEFAULT_PKG_LIST]: " NOTIF_PKG_LIST
+NOTIF_PKG_LIST="${NOTIF_PKG_LIST:-$DEFAULT_PKG_LIST}"
+ok "Notif packages: $NOTIF_PKG_LIST"
+
 CONFIG_FILE="$CONF_DIR/config.env"
 cat > "$CONFIG_FILE" <<EOF
 # fadzPay Config (auto-generated)
@@ -267,11 +261,13 @@ TOKEN='${TOKEN}'
 SECRET='${SECRET}'
 PIN='${PIN}'
 DEVICE_ID='${DEVICE_ID}'
-NOTIF_PKG_LIST='${NOTIF_PKG_LIST}'
 INTERVAL_SEC='${INTERVAL_SEC}'
 MIN_AMOUNT='${MIN_AMOUNT}'
 WATCHDOG_INTERVAL='${WATCHDOG_INTERVAL}'
 TMUX_SESSION='${TMUX_SESSION}'
+
+# ShopeePay notif packages (comma separated)
+NOTIF_PKG_LIST='${NOTIF_PKG_LIST}'
 
 # Queue features
 QUEUE_MAX_LINES='${QUEUE_MAX_LINES}'
@@ -281,9 +277,9 @@ EOF
 chmod 600 "$CONFIG_FILE"
 ok "Saved config: $CONFIG_FILE (chmod 600)"
 
-# ==========================================================================
+# ============================================================================
 # 6) Create Scripts
-# ==========================================================================
+# ============================================================================
 info "[6/8] Creating scripts..."
 
 # scan_notifs.sh
@@ -293,15 +289,6 @@ set -euo pipefail
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "❌ missing: $1"; exit 1; }; }
 need termux-notification-list
 need jq
-
-CONF="$HOME/fadzpay/config/config.env"
-NOTIF_PKG_LIST="com.shopee.id"
-if [ -f "$CONF" ]; then
-  # shellcheck disable=SC1090
-  source "$CONF" || true
-fi
-NOTIF_PKG_LIST="${NOTIF_PKG_LIST:-com.shopeepay.id,com.shopee.id}"
-PKG_REGEX="^($(echo "$NOTIF_PKG_LIST" | tr ',' '|' ))$"
 
 echo "════════════════════════════════════════════════════════════"
 echo "  fadzPay Notification Scanner"
@@ -314,15 +301,14 @@ termux-notification-list | jq -r '.[] | "\(.packageName)\t│\t\(.title)\t│\t\
 
 echo
 echo "────────────────────────────────────────────────────────────"
-echo "💰 ShopeePay/Shopee Notifications (filtered by NOTIF_PKG_LIST)"
-echo "PKG_REGEX: $PKG_REGEX"
+echo "💰 ShopeePay Notifications (com.shopeepay.id / com.shopee.id):"
 echo "────────────────────────────────────────────────────────────"
-termux-notification-list | jq -r --arg re "$PKG_REGEX" '.[] | select(.packageName|test($re)) | "Title: \(.title)\nContent: \(.content)\nWhen: \(.when)\nKey: \(.key // .id)\n"' 2>/dev/null || echo "No notifications"
+termux-notification-list | jq -r '.[] | select(.packageName=="com.shopeepay.id" or .packageName=="com.shopee.id") | "Pkg: \(.packageName)\nTitle: \(.title)\nContent: \(.content)\nWhen: \(.when)\nKey: \(.key // .id)\n---\n"' 2>/dev/null || echo "No ShopeePay notifications"
 SCAN_EOF
 chmod +x "$BIN_DIR/scan_notifs.sh"
 ok "Created: scan_notifs.sh"
 
-# forwarder.sh (queue + retry + ttl + net-check + queue dedupe + device_id)
+# forwarder.sh (queue + retry + ttl + net-check + queue dedupe + device_id + TXID)
 cat > "$BIN_DIR/forwarder.sh" <<'FORWARDER_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
@@ -338,18 +324,15 @@ QUEUE_DIR="$BASE_DIR/queue"
 QUEUE_FILE="$QUEUE_DIR/pending.jsonl"
 QUEUE_TMP="$QUEUE_DIR/pending.tmp"
 
-STATE_MAX_LINES=7000
+STATE_MAX_LINES=12000
 MAX_AMOUNT=100000000
 
-# Shopee app package (bisa multi) diambil dari config: NOTIF_PKG_LIST
-# Title/content pattern sesuai notif screenshot:
-#   Title  : "Pembayaran sebesar Rp2 diterima"
-#   Content: "Pembayaran sebesar Rp2 telah diterima pada transaksi 1335..."
-TITLE_REGEX='Pembayaran.*diterima'
-CONTENT_REGEX='transaksi[[:space:]]*[0-9]'
+# ShopeePay patterns (match your sample)
+TITLE_REGEX='^Pembayaran sebesar Rp[0-9][0-9\.\,]* diterima$'
+CONTENT_REGEX='telah diterima pada transaksi[[:space:]]+[0-9]+'
 
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "❌ Missing: $1"; exit 1; }; }
-need jq; need curl; need openssl; need awk; need grep; need sed; need sha256sum; need wc; need tail; need mv; need mkdir
+need jq; need curl; need openssl; need awk; need grep; need sed; need sha256sum; need wc; need tail; need mv; need mkdir; need tr
 need termux-notification-list; need termux-notification
 
 mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")" "$QUEUE_DIR" "$BASE_DIR/state"
@@ -372,9 +355,7 @@ QUEUE_TTL_HOURS="${QUEUE_TTL_HOURS:-48}"
 NETCHECK_ENABLE="${NETCHECK_ENABLE:-1}"
 INTERVAL_SEC="${INTERVAL_SEC:-0.5}"
 MIN_AMOUNT="${MIN_AMOUNT:-1}"
-
 NOTIF_PKG_LIST="${NOTIF_PKG_LIST:-com.shopeepay.id,com.shopee.id}"
-PKG_ALLOW_REGEX="^($(echo "$NOTIF_PKG_LIST" | tr ',' '|' ))$"
 
 TTL_MS=$(( QUEUE_TTL_HOURS * 60 * 60 * 1000 ))
 
@@ -394,20 +375,6 @@ trim_file_by_lines(){
 
 trim_state(){ trim_file_by_lines "$STATE_FILE" "$STATE_MAX_LINES"; }
 trim_queue(){ trim_file_by_lines "$QUEUE_FILE" "$QUEUE_MAX_LINES"; }
-
-extract_amount(){
-  local s="$1" a
-  a=$(printf '%s' "$s" | sed -nE 's/.*[Rr][Pp][[:space:]]*([0-9][0-9\.,]*).*/\1/p' | head -n1 || true)
-  a="${a//[^0-9]/}"
-  [ -n "$a" ] && echo "$a" || echo ""
-}
-
-extract_txid(){
-  local s="$1" t
-  t=$(printf '%s' "$s" | sed -nE 's/.*transaksi[[:space:]]*([0-9]{6,}).*/\1/p' | head -n1 || true)
-  t="${t//[^0-9]/}"
-  [ -n "$t" ] && echo "$t" || echo ""
-}
 
 now_ms(){
   local t
@@ -434,6 +401,35 @@ if [ -z "${DEVICE_ID}" ]; then
   echo "$DEVICE_ID" > "$DEVICE_ID_STATE"
   chmod 600 "$DEVICE_ID_STATE" 2>/dev/null || true
 fi
+
+# Parse comma-separated into space-separated for simple loop
+PKG_ALLOW_LIST="$(printf '%s' "$NOTIF_PKG_LIST" | tr ',' ' ' | tr -s ' ' | sed 's/^ *//;s/ *$//')"
+
+pkg_allowed(){
+  local pkg="$1"
+  for p in $PKG_ALLOW_LIST; do
+    [ "$pkg" = "$p" ] && return 0
+  done
+  return 1
+}
+
+# Extract amount from ShopeePay title:
+# "Pembayaran sebesar Rp2 diterima" -> 2
+extract_amount_from_title(){
+  local s="$1" a
+  a="$(printf '%s' "$s" | sed -nE 's/^Pembayaran sebesar Rp([0-9][0-9\.\,]*) diterima$/\1/p' | head -n1 || true)"
+  a="${a//[^0-9]/}"
+  [ -n "$a" ] && echo "$a" || echo ""
+}
+
+# Extract txid from content:
+# "... pada transaksi 133567874681028775." -> 133567874681028775
+extract_txid(){
+  local s="$1" t
+  t="$(printf '%s' "$s" | sed -nE 's/.*transaksi[[:space:]]+([0-9]{6,}).*/\1/p' | head -n1 || true)"
+  t="${t//[^0-9]/}"
+  [ -n "$t" ] && echo "$t" || echo ""
+}
 
 hmac_sig_hex(){
   local msg="$1"
@@ -473,13 +469,13 @@ net_is_up(){
 declare -A SEEN
 while read -r fp; do
   [ -n "$fp" ] && SEEN["$fp"]=1 || true
-done < <(tail -n 8000 "$STATE_FILE" 2>/dev/null || true)
+done < <(tail -n 12000 "$STATE_FILE" 2>/dev/null || true)
 
 declare -A QIDX
 if [ -s "$QUEUE_FILE" ]; then
   while read -r fp; do
     [ -n "$fp" ] && QIDX["$fp"]=1 || true
-  done < <(jq -r '.fingerprint // empty' "$QUEUE_FILE" 2>/dev/null | tail -n 12000 || true)
+  done < <(jq -r '.fingerprint // empty' "$QUEUE_FILE" 2>/dev/null | tail -n 20000 || true)
 fi
 
 rebuild_qidx(){
@@ -488,7 +484,7 @@ rebuild_qidx(){
   if [ -s "$QUEUE_FILE" ]; then
     while read -r fp; do
       [ -n "$fp" ] && QIDX["$fp"]=1 || true
-    done < <(jq -r '.fingerprint // empty' "$QUEUE_FILE" 2>/dev/null | tail -n 12000 || true)
+    done < <(jq -r '.fingerprint // empty' "$QUEUE_FILE" 2>/dev/null | tail -n 20000 || true)
   fi
 }
 
@@ -603,17 +599,16 @@ trap cleanup EXIT INT TERM
 termux-notification \
   --id walletfw \
   --title "fadzPay" \
-  --content "🚀 Running..." \
+  --content "🚀 Running (ShopeePay)..." \
   --ongoing --priority low --alert-once 2>/dev/null || true
 
 log "════════════════════════════════════════════════════════════"
-log "  fadzPay Forwarder (ShopeePay/Shopee) + Queue/TTL/NetCheck"
+log "  fadzPay Forwarder (ShopeePay) + Queue/TTL/NetCheck + TXID"
 log "════════════════════════════════════════════════════════════"
 log "▶️  Started: $(date '+%Y-%m-%d %H:%M:%S')"
 log "🎯 Target : $WEBHOOK_URL"
 log "📱 Device : $DEVICE_ID"
-log "📦 Packages: $NOTIF_PKG_LIST"
-log "🧩 PKG_REGEX: $PKG_ALLOW_REGEX"
+log "📦 PKGs   : $PKG_ALLOW_LIST"
 log "⏱️  Interval: ${INTERVAL_SEC}s"
 log "💰 Min Amount: Rp ${MIN_AMOUNT}"
 log "📦 Queue file: $QUEUE_FILE (max_lines=$QUEUE_MAX_LINES, ttl_h=$QUEUE_TTL_HOURS)"
@@ -623,7 +618,6 @@ log "═════════════════════════
 
 PROCESSED_COUNT=0
 ERROR_COUNT=0
-QUEUED_COUNT=0
 LAST_STATUS_PUSH=0
 STATUS_EVERY_MS=15000
 
@@ -638,7 +632,7 @@ while :; do
 
   while read -r row; do
     pkg="$(jq -r '.packageName // ""' <<<"$row")"
-    echo "$pkg" | grep -Eq "$PKG_ALLOW_REGEX" || continue
+    pkg_allowed "$pkg" || continue
 
     title="$(jq -r '.title // ""' <<<"$row")"
     content="$(jq -r '.content // ""' <<<"$row")"
@@ -649,26 +643,28 @@ while :; do
     when="$(jq -r '.when // ""' <<<"$row")"
     key="$(jq -r '.key // (.id|tostring) // ""' <<<"$row")"
 
-    amt="$(extract_amount "$title $content")"
+    amt="$(extract_amount_from_title "$title")"
+    txid="$(extract_txid "$content")"
+
     [ -n "$amt" ] || continue
+    [ -n "$txid" ] || continue
+
     if [ "$amt" -lt "$MIN_AMOUNT" ] || [ "$amt" -gt "$MAX_AMOUNT" ]; then
       continue
     fi
 
-    txid="$(extract_txid "$title $content")"
-
-    fingerprint="$(printf '%s' "$pkg|$title|$content|$when|$key" | sha256sum | awk '{print $1}')"
+    # ✅ fingerprint based on txid (super strong dedupe)
+    fingerprint="$(printf '%s' "$pkg|$txid" | sha256sum | awk '{print $1}')"
 
     if [[ -n "${SEEN[$fingerprint]:-}" ]]; then
       continue
     fi
-
     if [[ -n "${QIDX[$fingerprint]:-}" ]]; then
       continue
     fi
 
     payload="$(jq -nc \
-      --arg source "shopee_pay" \
+      --arg source "shopeepay" \
       --arg package "$pkg" \
       --arg title "$title" \
       --arg content "$content" \
@@ -676,8 +672,8 @@ while :; do
       --arg key "$key" \
       --arg fingerprint "$fingerprint" \
       --arg amount "$amt" \
-      --arg device_id "$DEVICE_ID" \
       --arg txid "$txid" \
+      --arg device_id "$DEVICE_ID" \
       '{
         source: $source,
         package: $package,
@@ -687,25 +683,24 @@ while :; do
         key: $key,
         fingerprint: $fingerprint,
         amount: ($amount|tonumber),
-        device_id: $device_id,
-        txid: ($txid|select(length>0) // null)
+        txid: $txid,
+        device_id: $device_id
       }'
     )"
 
     tslog="$(date '+%Y-%m-%d %H:%M:%S')"
     resp="$(post_json "$payload" || true)"
 
-    if [[ "$resp" =~ HTTP=2[0-9][0-9]$ ]]; then
+    if is_http_2xx "$resp"; then
       SEEN["$fingerprint"]=1
       echo "$fingerprint" >> "$STATE_FILE"
       trim_state
-      log "✓ $tslog | Rp ${amt} | ${resp} | txid=${txid:-NA} | ${title:0:50}..."
+      log "✓ $tslog | Rp ${amt} | txid=${txid} | ${resp} | ${title}"
       PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
     else
       queue_push "$fingerprint" "$payload"
-      log "✗ $tslog | Rp ${amt} | QUEUED | ${resp:0:120} | txid=${txid:-NA} | ${title:0:50}..."
+      log "✗ $tslog | Rp ${amt} | txid=${txid} | QUEUED | ${resp:0:120}"
       ERROR_COUNT=$((ERROR_COUNT + 1))
-      QUEUED_COUNT=$((QUEUED_COUNT + 1))
     fi
 
   done < <(jq -c '.[]' <<<"$json" 2>/dev/null || true)
@@ -830,7 +825,6 @@ if [ -f "$PID_FILE" ]; then
     exit 0
   fi
 fi
-
 echo $$ > "$PID_FILE"
 chmod 600 "$PID_FILE" 2>/dev/null || true
 
@@ -894,9 +888,9 @@ cp -f "$BIN_DIR/start-fadzpay.sh" "$BOOT_FILE"
 chmod +x "$BOOT_FILE"
 ok "Created boot script: $BOOT_FILE"
 
-# ==========================================================================
+# ============================================================================
 # 7) Optional: Root anti-doze (for dedicated device)
-# ==========================================================================
+# ============================================================================
 info "[7/8] Optional root optimization (anti-doze)..."
 if command -v su >/dev/null 2>&1; then
   rr="n"
@@ -905,27 +899,32 @@ if command -v su >/dev/null 2>&1; then
   if [ "$AUTO_YES" != "1" ]; then
     echo -e "${YELLOW}Kamu root. Apply anti-doze biar notif gak ketahan?${NC}"
     echo "Will run (best effort):"
-    echo "  dumpsys deviceidle whitelist +com.termux +com.termux.api +com.termux.boot +<shopee_pkgs>"
+    echo "  dumpsys deviceidle whitelist +com.termux +com.termux.api +com.termux.boot +com.shopeepay.id +com.shopee.id"
     echo "  cmd appops set <pkg> RUN_ANY_IN_BACKGROUND allow"
     echo "  cmd appops set <pkg> WAKE_LOCK allow"
+    echo "Optional: disable doze total"
     read -rp "Apply sekarang? (y/n): " -n 1 rr; echo
   else
     info "AUTO_YES=1 -> applying root anti-doze automatically"
   fi
 
   if [[ "${rr:-n}" =~ ^[Yy]$ ]]; then
-    # build list: termux + shopee pkgs
-    pkgs=(com.termux com.termux.api com.termux.boot)
-    IFS=',' read -r -a shpkgs <<< "${NOTIF_PKG_LIST:-com.shopeepay.id,com.shopee.id}"
-    for p in "${shpkgs[@]}"; do
-      [ -n "$p" ] && pkgs+=("$p") || true
-    done
-
-    for pkg in "${pkgs[@]}"; do
+    for pkg in com.termux com.termux.api com.termux.boot com.shopeepay.id com.shopee.id; do
       su -c "dumpsys deviceidle whitelist +$pkg" >/dev/null 2>&1 || true
       su -c "cmd appops set $pkg RUN_ANY_IN_BACKGROUND allow" >/dev/null 2>&1 || true
       su -c "cmd appops set $pkg WAKE_LOCK allow" >/dev/null 2>&1 || true
     done
+
+    rr2="n"
+    if [ "$AUTO_YES" = "1" ]; then rr2="y"; fi
+    if [ "$AUTO_YES" != "1" ]; then
+      read -rp "Disable DOZE total? (y/n): " -n 1 rr2; echo
+    fi
+    if [[ "${rr2:-n}" =~ ^[Yy]$ ]]; then
+      su -c "dumpsys deviceidle disable" >/dev/null 2>&1 || true
+      su -c "cmd deviceidle disable" >/dev/null 2>&1 || true
+      ok "Doze disabled (best effort)"
+    fi
 
     ok "Root optimization applied (best effort)"
   else
@@ -935,9 +934,9 @@ else
   warn "su not found, skip root optimization"
 fi
 
-# ==========================================================================
+# ============================================================================
 # 8) Start services (tmux + watchdog)
-# ==========================================================================
+# ============================================================================
 info "[8/8] Starting services..."
 "$BIN_DIR/forwarderctl.sh" start || true
 nohup bash "$BIN_DIR/watchdog.sh" >/dev/null 2>&1 & disown || true
@@ -952,14 +951,14 @@ echo -e "${CYAN}📁 Directory:${NC} $BASE_DIR"
 echo -e "${CYAN}⚙️ Config:${NC} $CONFIG_FILE (chmod 600)"
 echo
 echo -e "${CYAN}🔧 Commands:${NC}"
-echo "  Scan notif : $BIN_DIR/scan_notifs.sh"
-echo "  Status     : $BIN_DIR/forwarderctl.sh status"
-echo "  Attach     : $BIN_DIR/forwarderctl.sh attach"
-echo "  Restart    : $BIN_DIR/forwarderctl.sh restart"
-echo "  Stop       : $BIN_DIR/forwarderctl.sh stop"
-echo "  Logs       : tail -f $BASE_DIR/logs/fadzpay-forwarder.log"
-echo "  Watchdog   : tail -f $BASE_DIR/logs/fadzpay-watchdog.log"
-echo "  Queue      : wc -l $BASE_DIR/queue/pending.jsonl"
+echo "  Status : $BIN_DIR/forwarderctl.sh status"
+echo "  Attach : $BIN_DIR/forwarderctl.sh attach"
+echo "  Restart: $BIN_DIR/forwarderctl.sh restart"
+echo "  Stop   : $BIN_DIR/forwarderctl.sh stop"
+echo "  Logs   : tail -f $BASE_DIR/logs/fadzpay-forwarder.log"
+echo "  Watchdog: tail -f $BASE_DIR/logs/fadzpay-watchdog.log"
+echo "  Scanner: $BIN_DIR/scan_notifs.sh"
+echo "  Queue  : wc -l $BASE_DIR/queue/pending.jsonl"
 echo
 echo -e "${CYAN}🚀 Auto-start:${NC} $BOOT_FILE"
 echo
